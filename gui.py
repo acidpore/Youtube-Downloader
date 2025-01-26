@@ -120,12 +120,12 @@ class YouTubeDownloaderUI:
         media_type = self.media_type.get()
         if media_type == 'Video':
             self.quality_combobox['values'] = ('Best', '1080p', '720p', '480p', '360p')
-            self.quality_var.set(self.config_handler('get', 'video_resolution'))
+            self.quality_var.set(self.get_default_quality())
             self.audio_combobox.grid_remove()
             self.audio_format_label.grid_remove()
         else:
             self.quality_combobox['values'] = ('128k', '192k', '256k', '320k')
-            self.quality_var.set(self.config_handler('get', 'audio_quality'))
+            self.quality_var.set(self.get_default_quality())
             self.audio_combobox.grid()
             self.audio_format_label.grid()
         self.config_handler('update', 'media_type', media_type)
@@ -150,7 +150,7 @@ class YouTubeDownloaderUI:
             title="Select FFmpeg Executable",
             filetypes=(("Executable files", "*.exe;*.bin"), ("All files", "*.*"))
         )
-        if file_path and self.path_validator(file_path, is_ffmpeg=True):
+        if file_path and self.path_validator("dummy_path", file_path):
             self.ffmpeg_entry.delete(0, tk.END)
             self.ffmpeg_entry.insert(0, file_path)
             self.config_handler('update', 'ffmpeg_path', file_path)
