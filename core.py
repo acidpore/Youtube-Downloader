@@ -10,6 +10,7 @@ from collections import deque, OrderedDict
 from yt_dlp import YoutubeDL, DownloadError
 from typing import Optional, Callable
 
+ANSI_REGEX = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
 class DownloadManager:
     CONFIG_FILE = 'yt_downloader_config.json'
     MAX_RETRIES = 3
@@ -124,7 +125,6 @@ class DownloadManager:
                 self.handle_error(e, self.current_item)
 
             self.current_item = None
-            time.sleep(1)
 
         self.downloading = False
         if self.on_complete:
@@ -186,10 +186,10 @@ class DownloadManager:
 
     # Progress and Error Handling
     def progress_hook(self, d: dict):
-        if d['status'] == 'downloading':
+         if d['status'] == 'downloading':
             percent = d.get('percent', 0)
-            speed = re.sub(r'\x1B\[[0-?]*[ -/]*[@-~]', '', d.get('_speed_str', 'N/A')).strip()
-            eta = re.sub(r'\x1B\[[0-?]*[ -/]*[@-~]', '', d.get('_eta_str', 'N/A')).strip()
+            speed = ANSI_REGEX.sub('', d.get('_speed_str', 'N/A')).strip()
+            eta = ANSI_REGEX.sub('', d.get('_eta_str', 'N/A')).strip()
             
             if self.on_progress:
                 self.on_progress(percent, speed, eta)
@@ -198,7 +198,7 @@ class DownloadManager:
         error_msg = self.parse_error(error)
         logging.error(f"Download failed: {error_msg}")
         
-        if item['retries'] < self.MAX_RETRIES:
+        if item.get('retries', 0) < self.MAX_RETRIES:
             item['retries'] += 1
             with self.queue_lock:
                 self.download_queue.appendleft(item)
@@ -219,7 +219,7 @@ class DownloadManager:
 
     # Validation Methods
     def validate_paths(self, download_path: str, ffmpeg_path: str) -> bool:
-        valid_dl = os.path.exists(download_path)
+        valid_dl = os.path.exists(download_path) or os.makedirs(download_path, exist_ok=True)
         valid_ffmpeg = self.validate_ffmpeg(ffmpeg_path)
         return valid_dl and valid_ffmpeg
 
