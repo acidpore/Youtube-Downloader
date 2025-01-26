@@ -45,6 +45,20 @@ def main():
     # Path validator
     def path_validator(dl_path, ffmpeg_path):
         return dm.validate_paths(dl_path, ffmpeg_path)
+    
+    # Set up core callbacks with thread-safe updates
+    def safe_progress_update(percent, speed, eta):
+        root.after(0, app.update_progress, percent, speed, eta)
+    
+    def safe_status_update(msg, color):
+        root.after(0, app.status_label.config, {'text': msg, 'foreground': color})
+    
+    def safe_complete_update(success):
+        root.after(0, app.download_complete, success)
+
+    dm.on_progress = safe_progress_update
+    dm.on_status = safe_status_update
+    dm.on_complete = safe_complete_update
 
     # Initialize UI with dependency injection
     app = YouTubeDownloaderUI(
