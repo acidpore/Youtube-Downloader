@@ -1,20 +1,24 @@
-# main.py
 import tkinter as tk
-from gui import YouTubeDownloaderUI
+from gui import YouTubeDownloaderUI, EnhancedYouTubeDownloaderUI
 from core import DownloadManager
 
 def main():
-    # Initialize root window
+    # Initialize the main Tkinter window
     root = tk.Tk()
     root.title("YouTube Downloader")
     root.geometry("800x600")
-    root.resizable(False, False)
+    root.resizable(True, True)  # Allow window resizing
 
-    # Initialize core components
+    # Initialize the DownloadManager (core component)
     dm = DownloadManager()
 
-    # Configuration handler
-    def config_handler(action, key=None, value=None):
+    # -------------------------
+    # Handlers for Dependency Injection
+    # -------------------------
+    def config_handler(action: str, key: str = None, value=None):
+        """
+        Handles configuration get, update, and save actions.
+        """
         if action == 'get':
             return dm.config.get(key, '')
         elif action == 'update':
@@ -23,11 +27,12 @@ def main():
         elif action == 'save':
             dm.save_config()
 
-    # Queue handler
-    def queue_handler(action, data=None):
+    def queue_handler(action: str, data=None):
+        """
+        Handles queue operations: add, remove, clear, and URL validation.
+        """
         if action == 'add':
-            dm.add_to_queue(data)
-            return True
+            return dm.add_to_queue(data)
         elif action == 'remove':
             dm.remove_from_queue(data)
         elif action == 'clear':
@@ -35,33 +40,50 @@ def main():
         elif action == 'validate_url':
             return dm.validate_url(data)
 
-    # Download handler
-    def download_handler(action):
+    def download_handler(action: str):
+        """
+        Handles starting and canceling the download process.
+        """
         if action == 'start':
             dm.start_download()
         elif action == 'cancel':
             dm.cancel_download()
 
-    # Path validator
-    def path_validator(dl_path, ffmpeg_path):
+    def path_validator(dl_path: str, ffmpeg_path: str) -> bool:
+        """
+        Validates the download and FFmpeg paths using the DownloadManager.
+        """
         return dm.validate_paths(dl_path, ffmpeg_path)
+
+    # -------------------------
+    # Thread-Safe Callback Wrappers for UI Updates
+    # -------------------------
+    def safe_update_progress(percent: float, speed: str, eta: str, size: str):
+        # Schedule the progress update on the main thread
+        root.after(0, app.update_progress, percent, speed, eta, size)
     
-    # Set up core callbacks with thread-safe updates
-    def safe_progress_update(percent, speed, eta):
-        root.after(0, app.update_progress, percent, speed, eta)
-    
-    def safe_status_update(msg, color):
+    def safe_update_status(msg: str, color: str):
+        # Schedule the status update on the main thread
         root.after(0, app.status_label.config, {'text': msg, 'foreground': color})
-    
-    def safe_complete_update(success):
+
+    def safe_download_complete(success: bool):
+        # Schedule the download complete update on the main thread
         root.after(0, app.download_complete, success)
 
-    dm.on_progress = safe_progress_update
-    dm.on_status = safe_status_update
-    dm.on_complete = safe_complete_update
+    # Set core callbacks to our safe wrappers
+    dm.on_progress = safe_update_progress
+    dm.on_status = safe_update_status
+    dm.on_complete = safe_download_complete
 
-    # Initialize UI with dependency injection
-    app = YouTubeDownloaderUI(
+    # Add state observer
+    def on_state_change(downloading: bool, cancelled: bool):
+        root.after(0, app.update_download_state, downloading, cancelled)
+    dm.state.add_observer(on_state_change)
+
+    # -------------------------
+    # Initialize the Enhanced GUI and pass the dependencies
+    # -------------------------
+    app = EnhancedYouTubeDownloaderUI(
         root,
         config_handler=config_handler,
         queue_handler=queue_handler,
@@ -69,15 +91,10 @@ def main():
         path_validator=path_validator
     )
 
-    # Set up core callbacks
-    dm.on_progress = app.update_progress
-    dm.on_status = lambda msg, color: app.status_label.config(text=msg, foreground=color)
-    dm.on_complete = app.download_complete
-
-    # Start application
+    # Start the main event loop
     root.mainloop()
 
-    # Cleanup when window closes
+    # When the window closes, perform cleanup
     dm.cleanup()
 
 if __name__ == "__main__":
