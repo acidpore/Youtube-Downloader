@@ -29,13 +29,30 @@ class FakeYDL:
     def extract_info(self, url, download=False, process=True):
         return {'title': 'Title of ' + url}
 
+    # Seconds per simulated download step; tests can slow it down.
+    step = 0.02
+    running = 0
+    max_running = 0
+    lock = __import__('threading').Lock()
+
     def download(self, urls):
         if 'fail' in urls[0]:
             raise Exception('boom')
-        for i in range(1, 21):
-            for hook in self.opts['progress_hooks']:
-                hook({'status': 'downloading', 'downloaded_bytes': i, 'total_bytes': 20})
-            time.sleep(0.02)
+        with FakeYDL.lock:
+            FakeYDL.running += 1
+            FakeYDL.max_running = max(FakeYDL.max_running, FakeYDL.running)
+        tmp = os.path.join(self.opts['outtmpl'].split('%')[0], urls[0].rsplit('/', 1)[-1] + '.mp4')
+        try:
+            for i in range(1, 21):
+                if i == 1:
+                    open(tmp + '.part', 'w').close()
+                for hook in self.opts['progress_hooks']:
+                    hook({'status': 'downloading', 'downloaded_bytes': i, 'total_bytes': 20,
+                          'tmpfilename': tmp + '.part', 'filename': tmp, 'speed': 1000.0})
+                time.sleep(FakeYDL.step)
+        finally:
+            with FakeYDL.lock:
+                FakeYDL.running -= 1
 
 
 def make_item(url, **overrides):
@@ -58,18 +75,30 @@ class DownloadManagerTestBase(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.dm = core.DownloadManager()
         self.dm.RETRY_DELAY = 0
+        self.dm.config['max_concurrent'] = 1
         self.dm.clear_queue()
+        FakeYDL.step = 0.02
+        FakeYDL.max_running = 0
         self.statuses = []
         self.completed = []
         self.dm.on_item_status = lambda item_id, status: self.statuses.append(status)
         self.dm.on_complete = self.completed.append
 
-    def run_queue(self, timeout=10):
-        self.dm.start_download()
+    def wait_idle(self, timeout=10):
         end = time.time() + timeout
         while self.dm.state.downloading and time.time() < end:
             time.sleep(0.02)
         self.assertFalse(self.dm.state.downloading, "queue did not finish")
+
+    def wait_for(self, condition, timeout=5):
+        end = time.time() + timeout
+        while not condition() and time.time() < end:
+            time.sleep(0.01)
+        self.assertTrue(condition(), "condition not reached")
+
+    def run_queue(self, timeout=10):
+        self.dm.start_download()
+        self.wait_idle(timeout)
 
 
 class UrlValidationTest(unittest.TestCase):
@@ -173,19 +202,130 @@ class DownloadFlowTest(DownloadManagerTestBase):
         self.dm.start_download()
         time.sleep(0.1)
         self.dm.cancel_download()
-        end = time.time() + 5
-        while self.dm.state.downloading and time.time() < end:
-            time.sleep(0.02)
+        self.wait_idle(5)
         self.assertEqual(self.statuses, ['Downloading', 'Cancelled'])
         self.assertEqual(self.completed, [False])
         self.assertEqual(len(self.dm.get_queue()), 1)
+        # Only the cancelled item's partial file is removed.
+        self.assertFalse(os.path.exists(os.path.join(_TMP_HOME, 'a.mp4.part')))
 
     def test_progress_reported(self):
         progress = []
-        self.dm.on_progress = lambda percent, *rest: progress.append(percent)
+        self.dm.on_progress = lambda item_id, percent, *rest: progress.append(percent)
         self.dm.add_to_queue(make_item('https://youtu.be/ok'))
         self.run_queue()
         self.assertEqual(progress[-1], 100.0)
+
+
+class ParallelAndControlTest(DownloadManagerTestBase):
+    def test_parallel_downloads(self):
+        self.dm.config['max_concurrent'] = 3
+        for name in 'abcd':
+            self.dm.add_to_queue(make_item('https://youtu.be/p' + name))
+        self.run_queue()
+        self.assertEqual(FakeYDL.max_running, 3)
+        self.assertEqual(self.statuses.count('Complete'), 4)
+        self.assertEqual(self.completed, [True])
+
+    def test_pause_and_resume_keeps_partial_file(self):
+        FakeYDL.step = 0.05
+        item = make_item('https://youtu.be/pause1')
+        self.dm.add_to_queue(item)
+        self.dm.start_download()
+        self.wait_for(lambda: item['id'] in self.dm.active)
+        time.sleep(0.1)
+        self.assertTrue(self.dm.pause_item(item['id']))
+        self.wait_idle()
+        self.assertEqual(self.statuses[-1], 'Paused')
+        self.assertIn(item['id'], self.dm.paused)
+        self.assertTrue(os.path.exists(os.path.join(_TMP_HOME, 'pause1.mp4.part')))
+        # Paused items survive a restart.
+        self.assertIn(item['id'], core.DownloadManager().paused)
+
+        FakeYDL.step = 0.01
+        self.assertTrue(self.dm.resume_item(item['id']))
+        self.wait_idle()
+        self.assertEqual(self.statuses[-1], 'Complete')
+        self.assertNotIn(item['id'], self.dm.paused)
+
+    def test_pause_waiting_item(self):
+        item = make_item('https://youtu.be/wait')
+        self.dm.add_to_queue(item)
+        self.assertTrue(self.dm.pause_item(item['id']))
+        self.assertEqual(self.dm.get_queue(), [])
+        self.assertEqual([i['id'] for i in self.dm.get_items()], [item['id']])
+
+    def test_retry_failed_item(self):
+        item = make_item('https://youtu.be/fail-then-ok')
+        self.dm.add_to_queue(item)
+        self.run_queue()
+        self.assertEqual(self.statuses[-1], 'Failed')
+        self.assertIn(item['id'], self.dm.finished)
+        item['url'] = 'https://youtu.be/now-ok'
+        self.assertTrue(self.dm.retry_item(item['id']))
+        self.wait_idle()
+        self.assertEqual(self.statuses[-1], 'Complete')
+
+    def test_cancel_single_item(self):
+        FakeYDL.step = 0.05
+        self.dm.config['max_concurrent'] = 2
+        first, second = make_item('https://youtu.be/c1'), make_item('https://youtu.be/c2')
+        self.dm.add_to_queue(first)
+        self.dm.add_to_queue(second)
+        self.dm.start_download()
+        self.wait_for(lambda: len(self.dm.active) == 2)
+        self.dm.cancel_item(first['id'])
+        self.wait_idle()
+        self.assertIn(first['id'], self.dm.finished)
+        self.assertEqual(self.dm.history.history[0]['status'], 'Complete')
+
+
+class OptionsFromConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.dm = core.DownloadManager()
+
+    def test_extras(self):
+        self.dm.config.update(embed_subtitles=True, subtitle_langs='en, id', embed_thumbnail=True,
+                              add_metadata=True, cookies_browser='firefox', rate_limit_kb=1000,
+                              max_concurrent=2)
+        opts = self.dm.build_ydl_opts(make_item('https://youtu.be/x', playlist_items='1,3'))
+        keys = [p['key'] for p in opts['postprocessors']]
+        self.assertEqual(opts['subtitleslangs'], ['en', 'id'])
+        self.assertIn('FFmpegEmbedSubtitle', keys)
+        self.assertIn('FFmpegMetadata', keys)
+        self.assertEqual(keys[-1], 'EmbedThumbnail')
+        self.assertEqual(opts['cookiesfrombrowser'], ('firefox',))
+        self.assertEqual(opts['ratelimit'], 512000)
+        self.assertEqual(opts['playlist_items'], '1,3')
+
+    def test_no_thumbnail_for_wav(self):
+        self.dm.config.update(embed_thumbnail=True)
+        opts = self.dm.build_ydl_opts(make_item('https://youtu.be/x', media_type='Audio',
+                                                quality='192k', audio_format='wav'))
+        self.assertNotIn('writethumbnail', opts)
+
+    def test_defaults_off(self):
+        self.dm.config.update(embed_subtitles=False, embed_thumbnail=False, add_metadata=False,
+                              cookies_browser='', rate_limit_kb=0)
+        opts = self.dm.build_ydl_opts(make_item('https://youtu.be/x'))
+        for key in ('writesubtitles', 'writethumbnail', 'cookiesfrombrowser', 'ratelimit', 'postprocessors'):
+            self.assertNotIn(key, opts)
+
+    def test_config_validation(self):
+        cfg = self.dm.validate_config({'max_concurrent': 9, 'rate_limit_kb': 'x', 'cookies_browser': 'ie',
+                                       'embed_subtitles': 'yes', 'watch_clipboard': False})
+        self.assertEqual(cfg['max_concurrent'], 2)
+        self.assertEqual(cfg['rate_limit_kb'], 0)
+        self.assertEqual(cfg['cookies_browser'], '')
+        self.assertFalse(cfg['embed_subtitles'])
+        self.assertFalse(cfg['watch_clipboard'])
+
+    def test_update_config_validates(self):
+        self.dm.update_config('max_concurrent', '3')
+        self.assertEqual(self.dm.config['max_concurrent'], 3)
+
+    def test_yt_dlp_version(self):
+        self.assertNotEqual(self.dm.get_yt_dlp_version(), '')
 
 
 class FfmpegTest(unittest.TestCase):

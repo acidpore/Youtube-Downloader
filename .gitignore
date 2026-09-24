@@ -4,3 +4,7 @@ yt_downloader.log
 yt_downloader_config.json
 queue_state.json
 download_history.json
+build/
+dist/
+packaging/ffmpeg/
+*.spec

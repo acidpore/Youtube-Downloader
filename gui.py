@@ -2,11 +2,13 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import tkinter as tk
+import urllib.request
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core import Config
 
@@ -34,7 +36,27 @@ STATUS_COLORS = {'green': 'success', 'red': 'error', 'orange': 'warning',
                  'black': 'fg', 'gray': 'muted', 'blue': 'info'}
 
 STATUS_TAGS = {'Complete': 'complete', 'Failed': 'error', 'Cancelled': 'error',
-               'Downloading': 'processing'}
+               'Downloading': 'processing', 'Paused': 'paused'}
+FINISHED_STATUSES = ('Complete', 'Failed', 'Cancelled')
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if not seconds:
+        return ''
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def format_bytes(size: Optional[float]) -> str:
+    if not size:
+        return ''
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if size < 1024 or unit == 'GB':
+            return f"{size:.0f} {unit}" if unit in ('B', 'KB') else f"{size:.1f} {unit}"
+        size /= 1024
+    return ''
 
 URL_PLACEHOLDER = "Paste one or more YouTube links here, one per line…"
 
@@ -58,7 +80,10 @@ class YouTubeDownloaderUI:
 
         self.downloading = False
         self.cancel_requested = False
-        self.current_item_id: Optional[str] = None
+        self.active_ids: set = set()
+        self.item_progress: Dict[str, float] = {}
+        self.item_speed: Dict[str, float] = {}
+        self._last_clipboard = ''
         self._status_reset_job: Optional[str] = None
         self._status_color = 'muted'
         self._placeholder_active = False
@@ -90,6 +115,8 @@ class YouTubeDownloaderUI:
         self._show_placeholder()
         self._load_existing_queue()
         self._refresh_queue_summary()
+        self._last_clipboard = self._read_clipboard()
+        self.root.after(1000, self._poll_clipboard)
 
     # ------------------------------------------------------------------
     # Setup
@@ -230,9 +257,15 @@ class YouTubeDownloaderUI:
 
         toolbar = ttk.Frame(card, style='Card.TFrame')
         toolbar.grid(row=2, column=0, sticky=tk.EW, pady=(8, 0))
-        ttk.Button(toolbar, text="Remove", command=self.remove_selected).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Clear finished", command=self.clear_completed).pack(side=tk.LEFT, padx=6)
-        ttk.Button(toolbar, text="Clear all", command=self.clear_queue).pack(side=tk.LEFT)
+        self.preview_btn = ttk.Button(toolbar, text="Preview…", command=self.show_preview)
+        self.preview_btn.pack(side=tk.LEFT)
+        self.pause_btn = ttk.Button(toolbar, text="Pause", command=self.pause_selected)
+        self.pause_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.resume_btn = ttk.Button(toolbar, text="Resume / Retry", command=self.resume_selected)
+        self.resume_btn.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(toolbar, text="Clear all", command=self.clear_queue).pack(side=tk.RIGHT)
+        ttk.Button(toolbar, text="Clear finished", command=self.clear_completed).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(toolbar, text="Remove", command=self.remove_selected).pack(side=tk.RIGHT)
 
     def _build_footer(self) -> None:
         footer = ttk.Frame(self.main_frame, style='Card.TFrame', padding=12)
@@ -260,6 +293,12 @@ class YouTubeDownloaderUI:
 
     def _build_context_menu(self) -> None:
         self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="Preview / choose videos…", command=self.show_preview)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Pause", command=self.pause_selected)
+        self.context_menu.add_command(label="Resume / Retry", command=self.resume_selected)
+        self.context_menu.add_command(label="Cancel", command=self.cancel_selected)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="Open in browser", command=self._open_in_browser)
         self.context_menu.add_command(label="Copy link", command=self._copy_link)
         self.context_menu.add_separator()
@@ -288,6 +327,9 @@ class YouTubeDownloaderUI:
             (self.theme_btn, "Switch light / dark theme"),
             (self.settings_btn, "Settings (FFmpeg)"),
             (self.queue_tree, "Double-click to open in browser, right-click for more"),
+            (self.preview_btn, "Show details; pick which videos of a playlist to download"),
+            (self.pause_btn, "Pause the selected items (the partial download is kept)"),
+            (self.resume_btn, "Resume paused items or retry failed ones"),
         ):
             self.tooltips.append(Tooltip(widget, text))
 
@@ -343,6 +385,10 @@ class YouTubeDownloaderUI:
         self.root.option_add('*TCombobox*Listbox.selectBackground', c['accent'])
         self.root.option_add('*TCombobox*Listbox.selectForeground', c['accent_fg'])
 
+        s.configure('Card.TCheckbutton', background=c['card'], foreground=c['fg'],
+                    indicatorcolor=c['input'], padding=(0, 3))
+        s.map('Card.TCheckbutton', background=[('active', c['card'])],
+              indicatorcolor=[('selected', c['accent'])])
         s.configure('Toggle.TRadiobutton', background=c['card'], foreground=c['fg'],
                     indicatorcolor=c['input'], padding=(4, 2))
         s.map('Toggle.TRadiobutton', background=[('active', c['card'])],
@@ -365,6 +411,7 @@ class YouTubeDownloaderUI:
         self.queue_tree.tag_configure('complete', foreground=c['success'])
         self.queue_tree.tag_configure('error', foreground=c['error'])
         self.queue_tree.tag_configure('processing', foreground=c['info'])
+        self.queue_tree.tag_configure('paused', foreground=c['warning'])
 
         self.url_text.configure(background=c['input'], foreground=c['fg'], insertbackground=c['fg'],
                                 highlightbackground=c['border'], highlightcolor=c['accent'],
@@ -494,67 +541,417 @@ class YouTubeDownloaderUI:
             self.path_entry.insert(0, folder)
             self.config_handler('update', 'download_path', folder)
 
-    def show_settings(self) -> None:
-        """Dialog for the FFmpeg location."""
-        c = self.colors
+    def _dialog(self, title: str) -> Tuple[tk.Toplevel, ttk.Frame]:
+        """A themed modal-less child window with a card frame."""
         win = tk.Toplevel(self.root)
-        win.title("Settings")
-        win.configure(background=c['bg'])
+        win.title(title)
+        win.configure(background=self.colors['bg'])
         win.transient(self.root)
-        win.resizable(False, False)
         frame = ttk.Frame(win, style='Card.TFrame', padding=16)
         frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-        frame.columnconfigure(0, weight=1)
+        win.bind('<Escape>', lambda e: win.destroy())
+        return win, frame
 
-        ttk.Label(frame, text="FFmpeg", style='Section.TLabel').grid(row=0, column=0, sticky=tk.W)
-        ttk.Label(frame, text="Needed to merge video and audio and to convert audio.",
-                  style='CardMuted.TLabel').grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
-        entry = ttk.Entry(frame, width=48)
-        entry.insert(0, self.ffmpeg_entry.get())
-        entry.grid(row=2, column=0, sticky=tk.EW)
-        result = ttk.Label(frame, text="", style='CardMuted.TLabel')
-        result.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
+    def show_settings(self) -> None:
+        """Settings: FFmpeg, parallel downloads, speed limit, extras, cookies, yt-dlp."""
+        c = self.colors
+        get = lambda key: self.config_handler('get', key)
+        win, frame = self._dialog("Settings")
+        win.resizable(False, False)
+        frame.columnconfigure(1, weight=1)
+        row = 0
 
-        def browse() -> None:
+        def section(text: str) -> None:
+            nonlocal row
+            ttk.Label(frame, text=text, style='Section.TLabel').grid(
+                row=row, column=0, columnspan=3, sticky=tk.W, pady=(12 if row else 0, 4))
+            row += 1
+
+        def label(text: str) -> None:
+            ttk.Label(frame, text=text, style='Card.TLabel').grid(row=row, column=0, sticky=tk.W, padx=(0, 12), pady=3)
+
+        # --- FFmpeg
+        section("FFmpeg")
+        label("Location")
+        ffmpeg_entry = ttk.Entry(frame, width=44)
+        ffmpeg_entry.insert(0, self.ffmpeg_entry.get())
+        ffmpeg_entry.grid(row=row, column=1, sticky=tk.EW)
+
+        def browse_ffmpeg() -> None:
             path = filedialog.askopenfilename(parent=win, title="Select FFmpeg executable")
             if path:
-                entry.delete(0, tk.END)
-                entry.insert(0, path)
+                ffmpeg_entry.delete(0, tk.END)
+                ffmpeg_entry.insert(0, path)
+        ttk.Button(frame, text="Browse…", command=browse_ffmpeg).grid(row=row, column=2, padx=(6, 0))
+        row += 1
+
+        # --- Downloads
+        section("Downloads")
+        label("Parallel downloads")
+        concurrent_var = tk.StringVar(value=str(get('max_concurrent') or 2))
+        ttk.Combobox(frame, textvariable=concurrent_var, values=('1', '2', '3'), width=4,
+                     state='readonly').grid(row=row, column=1, sticky=tk.W)
+        row += 1
+        label("Speed limit (KB/s)")
+        limit_var = tk.StringVar(value=str(get('rate_limit_kb') or 0))
+        limit_frame = ttk.Frame(frame, style='Card.TFrame')
+        limit_frame.grid(row=row, column=1, columnspan=2, sticky=tk.W)
+        ttk.Entry(limit_frame, textvariable=limit_var, width=10).pack(side=tk.LEFT)
+        ttk.Label(limit_frame, text="0 = unlimited, shared by all downloads",
+                  style='CardMuted.TLabel').pack(side=tk.LEFT, padx=8)
+        row += 1
+
+        # --- Extras
+        section("Add to files")
+        subs_var = tk.BooleanVar(value=bool(get('embed_subtitles')))
+        thumb_var = tk.BooleanVar(value=bool(get('embed_thumbnail')))
+        meta_var = tk.BooleanVar(value=bool(get('add_metadata')))
+        ttk.Checkbutton(frame, text="Subtitles (video)", variable=subs_var,
+                        style='Card.TCheckbutton').grid(row=row, column=0, sticky=tk.W)
+        langs_frame = ttk.Frame(frame, style='Card.TFrame')
+        langs_frame.grid(row=row, column=1, columnspan=2, sticky=tk.W)
+        ttk.Label(langs_frame, text="Languages", style='Card.TLabel').pack(side=tk.LEFT)
+        langs_entry = ttk.Entry(langs_frame, width=14)
+        langs_entry.insert(0, get('subtitle_langs') or 'en,id')
+        langs_entry.pack(side=tk.LEFT, padx=6)
+        ttk.Label(langs_frame, text="e.g. en,id", style='CardMuted.TLabel').pack(side=tk.LEFT)
+        row += 1
+        ttk.Checkbutton(frame, text="Thumbnail as cover art", variable=thumb_var,
+                        style='Card.TCheckbutton').grid(row=row, column=0, columnspan=3, sticky=tk.W)
+        row += 1
+        ttk.Checkbutton(frame, text="Metadata (title, artist, date…)", variable=meta_var,
+                        style='Card.TCheckbutton').grid(row=row, column=0, columnspan=3, sticky=tk.W)
+        row += 1
+
+        # --- Access
+        section("Age-restricted / members-only videos")
+        label("Cookies from browser")
+        browser_var = tk.StringVar(value=get('cookies_browser') or 'none')
+        ttk.Combobox(frame, textvariable=browser_var, width=12, state='readonly',
+                     values=['none'] + [b for b in Config.COOKIE_BROWSERS if b]
+                     ).grid(row=row, column=1, sticky=tk.W)
+        row += 1
+        ttk.Label(frame, text="Uses your browser login. Close the browser first if reading cookies fails.",
+                  style='CardMuted.TLabel').grid(row=row, column=0, columnspan=3, sticky=tk.W)
+        row += 1
+
+        # --- Behaviour
+        section("Behaviour")
+        clip_var = tk.BooleanVar(value=bool(get('watch_clipboard')))
+        ttk.Checkbutton(frame, text="Detect YouTube links copied to the clipboard", variable=clip_var,
+                        style='Card.TCheckbutton').grid(row=row, column=0, columnspan=3, sticky=tk.W)
+        row += 1
+
+        # --- yt-dlp
+        section("yt-dlp")
+        version_label = ttk.Label(frame, text=f"Installed version: {self.queue_handler('yt_dlp_version')}",
+                                  style='Card.TLabel')
+        version_label.grid(row=row, column=0, columnspan=2, sticky=tk.W)
+        update_btn = ttk.Button(frame, text="Update yt-dlp")
+        update_btn.grid(row=row, column=2, sticky=tk.E)
+        row += 1
+        update_result = ttk.Label(frame, text="If downloads start failing, update yt-dlp first.",
+                                  style='CardMuted.TLabel', wraplength=460)
+        update_result.grid(row=row, column=0, columnspan=3, sticky=tk.W)
+        row += 1
+
+        def run_update() -> None:
+            update_btn.config(state=tk.DISABLED, text="Updating…")
+            update_result.config(text="Downloading the latest yt-dlp…", foreground=c['muted'])
+
+            def work() -> None:
+                ok, message = self.queue_handler('update_yt_dlp')
+                self.root.after(0, done, ok, message)
+
+            def done(ok: bool, message: str) -> None:
+                if not update_btn.winfo_exists():
+                    return
+                update_btn.config(state=tk.NORMAL, text="Update yt-dlp")
+                update_result.config(text=message, foreground=c['success' if ok else 'error'])
+            threading.Thread(target=work, daemon=True).start()
+        update_btn.config(command=run_update)
+
+        error_label = ttk.Label(frame, text="", style='CardMuted.TLabel')
+        error_label.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        row += 1
 
         def save() -> None:
-            path = entry.get().strip()
-            if self.path_validator(self.path_entry.get(), path):
+            ffmpeg = ffmpeg_entry.get().strip()
+            if ffmpeg != self.ffmpeg_entry.get():
+                if ffmpeg and not self.path_validator(self.path_entry.get(), ffmpeg):
+                    error_label.config(text="✗ FFmpeg: not a working FFmpeg executable", foreground=c['error'])
+                    return
                 self.ffmpeg_entry.delete(0, tk.END)
-                self.ffmpeg_entry.insert(0, path)
-                self.config_handler('update', 'ffmpeg_path', path)
-                self.set_status("FFmpeg configured", 'green')
-                win.destroy()
-            else:
-                result.config(text="✗ Not a working FFmpeg executable", foreground=c['error'])
+                self.ffmpeg_entry.insert(0, ffmpeg)
+                self.config_handler('update', 'ffmpeg_path', ffmpeg)
+            try:
+                limit = int(limit_var.get().strip() or 0)
+                if limit < 0:
+                    raise ValueError
+            except ValueError:
+                error_label.config(text="✗ Speed limit must be a whole number ≥ 0", foreground=c['error'])
+                return
+            browser = browser_var.get()
+            for key, value in (('max_concurrent', int(concurrent_var.get())), ('rate_limit_kb', limit),
+                               ('embed_subtitles', subs_var.get()),
+                               ('subtitle_langs', langs_entry.get().strip() or 'en'),
+                               ('embed_thumbnail', thumb_var.get()), ('add_metadata', meta_var.get()),
+                               ('cookies_browser', '' if browser == 'none' else browser),
+                               ('watch_clipboard', clip_var.get())):
+                self.config_handler('update', key, value)
+            self.set_status("Settings saved", 'green', reset_after=3000)
+            win.destroy()
 
-        ttk.Button(frame, text="Browse…", command=browse).grid(row=2, column=1, padx=(6, 0))
         buttons = ttk.Frame(frame, style='Card.TFrame')
-        buttons.grid(row=4, column=0, columnspan=3, sticky=tk.E, pady=(12, 0))
-        ttk.Button(buttons, text="Download FFmpeg",
+        buttons.grid(row=row, column=0, columnspan=3, sticky=tk.E, pady=(12, 0))
+        ttk.Button(buttons, text="Get FFmpeg",
                    command=lambda: webbrowser.open('https://ffmpeg.org/download.html')).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=6)
         ttk.Button(buttons, text="Save", style='Accent.TButton', command=save).pack(side=tk.LEFT)
-        win.bind('<Escape>', lambda e: win.destroy())
         win.grab_set()
-        entry.focus_set()
+
+    # ------------------------------------------------------------------
+    # Preview
+    # ------------------------------------------------------------------
+
+    def show_preview(self) -> None:
+        """Show details of the selected item; for playlists, choose which videos to get."""
+        selected = self.queue_tree.selection()
+        if not selected:
+            self.set_status("Select an item in the queue to preview", 'orange', reset_after=3000)
+            return
+        item_id = selected[0]
+        url = self.queue_tree.set(item_id, 'url')
+        c = self.colors
+        win, frame = self._dialog("Preview")
+        win.geometry("620x480")
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(2, weight=1)
+
+        thumb_label = ttk.Label(frame, style='Card.TLabel')
+        thumb_label.grid(row=0, column=0, rowspan=2, sticky=tk.NW, padx=(0, 12))
+        title_label = ttk.Label(frame, text="Loading details…", style='Section.TLabel', wraplength=380)
+        title_label.grid(row=0, column=1, sticky=tk.NW)
+        meta_label = ttk.Label(frame, text=url, style='CardMuted.TLabel', wraplength=380)
+        meta_label.grid(row=1, column=1, sticky=tk.NW, pady=(4, 0))
+
+        def work() -> None:
+            try:
+                info = self.queue_handler('fetch_info', url)
+            except Exception as e:  # network or extraction error
+                self.root.after(0, failed, str(e))
+                return
+            self.root.after(0, loaded, info)
+            thumb = self._load_thumbnail(info.get('thumbnail'))
+            if thumb is not None:
+                self.root.after(0, show_thumb, thumb)
+
+        def failed(message: str) -> None:
+            if win.winfo_exists():
+                title_label.config(text="Could not load details")
+                meta_label.config(text=message.replace('ERROR: ', '')[:300], foreground=c['error'])
+
+        def show_thumb(data: Any) -> None:
+            if not win.winfo_exists():
+                return
+            try:
+                from PIL import ImageTk
+                image = ImageTk.PhotoImage(data)
+            except Exception:
+                return
+            thumb_label.configure(image=image)
+            thumb_label.image = image  # keep a reference
+
+        def loaded(info: Dict[str, Any]) -> None:
+            if not win.winfo_exists():
+                return
+            title_label.config(text=info['title'])
+            if self.queue_tree.exists(item_id):
+                self.update_queue_item_title(item_id, info['title'])
+            parts = [info.get('uploader'), format_duration(info.get('duration'))]
+            if info.get('view_count'):
+                parts.append(f"{info['view_count']:,} views")
+            if info.get('filesize'):
+                parts.append(f"≈ {format_bytes(info['filesize'])}")
+            if info['entries']:
+                parts.append(f"{len(info['entries'])} videos")
+            meta_label.config(text="  ·  ".join(p for p in parts if p))
+            if info['entries']:
+                build_playlist(info['entries'])
+            else:
+                ttk.Button(frame, text="Close", command=win.destroy).grid(
+                    row=3, column=0, columnspan=2, sticky=tk.E, pady=(12, 0))
+
+        def build_playlist(entries: List[Dict[str, Any]]) -> None:
+            chosen = set(self._parse_playlist_items(self.queue_tree.set(item_id, 'quality')))
+            list_frame = ttk.Frame(frame, style='Card.TFrame')
+            list_frame.grid(row=2, column=0, columnspan=2, sticky=tk.NSEW, pady=(12, 0))
+            list_frame.columnconfigure(0, weight=1)
+            list_frame.rowconfigure(0, weight=1)
+            tree = ttk.Treeview(list_frame, columns=('check', 'index', 'title', 'duration'), show='headings',
+                                selectmode='none')
+            for col, text, width, stretch in (('check', "", 30, False), ('index', "#", 44, False),
+                                              ('title', "Title", 380, True), ('duration', "Length", 70, False)):
+                tree.heading(col, text=text, anchor=tk.W)
+                tree.column(col, width=width, stretch=stretch, anchor=tk.W)
+            scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
+            tree.configure(yscrollcommand=scroll.set)
+            tree.grid(row=0, column=0, sticky=tk.NSEW)
+            scroll.grid(row=0, column=1, sticky=tk.NS)
+            for entry in entries:
+                mark = '☑' if not chosen or entry['index'] in chosen else '☐'
+                tree.insert('', tk.END, iid=str(entry['index']),
+                            values=(mark, entry['index'], entry['title'], format_duration(entry.get('duration'))))
+
+            count_label = ttk.Label(frame, style='CardMuted.TLabel')
+            count_label.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+
+            def refresh_count() -> None:
+                picked = sum(1 for iid in tree.get_children() if tree.set(iid, 'check') == '☑')
+                count_label.config(text=f"{picked} of {len(entries)} selected — click a row to toggle")
+
+            def toggle(event: tk.Event) -> None:
+                row_id = tree.identify_row(event.y)
+                if row_id:
+                    tree.set(row_id, 'check', '☐' if tree.set(row_id, 'check') == '☑' else '☑')
+                    refresh_count()
+
+            def set_all(value: str) -> None:
+                for iid in tree.get_children():
+                    tree.set(iid, 'check', value)
+                refresh_count()
+
+            def apply() -> None:
+                picked = [int(iid) for iid in tree.get_children() if tree.set(iid, 'check') == '☑']
+                if not picked:
+                    count_label.config(text="Select at least one video", foreground=c['error'])
+                    return
+                spec = '' if len(picked) == len(entries) else self._format_playlist_items(picked)
+                if self.queue_handler('update_item', (item_id, {'playlist_items': spec})):
+                    self._update_row_playlist(item_id, spec)
+                    self.set_status(f"Will download {len(picked)} of {len(entries)} videos", 'green',
+                                    reset_after=4000)
+                    win.destroy()
+                else:
+                    count_label.config(text="This item already started — pause it first", foreground=c['error'])
+
+            tree.bind('<Button-1>', toggle)
+            refresh_count()
+            buttons = ttk.Frame(frame, style='Card.TFrame')
+            buttons.grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
+            ttk.Button(buttons, text="Select all", command=lambda: set_all('☑')).pack(side=tk.LEFT)
+            ttk.Button(buttons, text="Select none", command=lambda: set_all('☐')).pack(side=tk.LEFT, padx=6)
+            ttk.Button(buttons, text="Apply", style='Accent.TButton', command=apply).pack(side=tk.RIGHT)
+            ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=6)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _load_thumbnail(url: Optional[str]) -> Any:
+        """Download a thumbnail and return a PIL image, or None (Pillow is optional)."""
+        if not url:
+            return None
+        try:
+            import io
+            from PIL import Image
+            with urllib.request.urlopen(url, timeout=10) as response:
+                image = Image.open(io.BytesIO(response.read()))
+                image.load()
+            image.thumbnail((200, 112))
+            return image
+        except Exception:
+            return None
+
+    @staticmethod
+    def _format_playlist_items(indexes: List[int]) -> str:
+        """[1,2,3,5,7,8] -> '1-3,5,7-8' (yt-dlp playlist_items syntax)."""
+        parts: List[str] = []
+        start = prev = None
+        for index in sorted(indexes) + [None]:
+            if start is None:
+                start = prev = index
+            elif index is not None and index == prev + 1:
+                prev = index
+            else:
+                parts.append(str(start) if start == prev else f"{start}-{prev}")
+                start = prev = index
+        return ','.join(parts)
+
+    @staticmethod
+    def _parse_playlist_items(text: str) -> List[int]:
+        """Read the '#1-3,5' suffix shown in the Quality column back into indexes."""
+        if '#' not in text:
+            return []
+        indexes: List[int] = []
+        for part in text.split('#', 1)[1].split(','):
+            part = part.strip()
+            if '-' in part:
+                low, high = part.split('-', 1)
+                if low.isdigit() and high.isdigit():
+                    indexes.extend(range(int(low), int(high) + 1))
+            elif part.isdigit():
+                indexes.append(int(part))
+        return indexes
+
+    def _update_row_playlist(self, item_id: str, spec: str) -> None:
+        quality = self.queue_tree.set(item_id, 'quality').split(' · #')[0]
+        self.queue_tree.set(item_id, 'quality', f"{quality} · #{spec}" if spec else quality)
+
+    # ------------------------------------------------------------------
+    # Clipboard
+    # ------------------------------------------------------------------
+
+    def _read_clipboard(self) -> str:
+        try:
+            return self.root.clipboard_get()
+        except tk.TclError:
+            return ''
+
+    def _poll_clipboard(self) -> None:
+        """Put newly copied YouTube links into the link box."""
+        try:
+            if self.config_handler('get', 'watch_clipboard'):
+                text = self._read_clipboard()
+                if text and text != self._last_clipboard:
+                    self._last_clipboard = text
+                    self._take_clipboard_links(text)
+        finally:
+            self.root.after(1000, self._poll_clipboard)
+
+    def _take_clipboard_links(self, text: str) -> None:
+        lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+        if not lines or len(lines) > 200 or not all(self.queue_handler('validate_url', l) for l in lines):
+            return
+        known = set(self._get_url_lines())
+        known.update(self.queue_tree.set(iid, 'url') for iid in self.queue_tree.get_children())
+        new = [line for line in lines if line not in known]
+        if not new:
+            return
+        self._hide_placeholder()
+        current = self.url_text.get('1.0', 'end-1c')
+        if current and not current.endswith('\n'):
+            self.url_text.insert(tk.END, '\n')
+        self.url_text.insert(tk.END, '\n'.join(new) + '\n')
+        self._validate_urls()
+        self.set_status(f"Link{'s' if len(new) > 1 else ''} from clipboard ready — press Add to queue",
+                        'black', reset_after=5000)
 
     # ------------------------------------------------------------------
     # Queue
     # ------------------------------------------------------------------
 
     def _load_existing_queue(self) -> None:
-        for item in self.queue_handler('list') or []:
+        for item in self.queue_handler('items') or []:
             self._insert_queue_row(item)
+            if item.get('state') == 'paused':
+                self.update_queue_item_status(item['id'], 'Paused')
 
     def _insert_queue_row(self, item: Dict[str, Any]) -> None:
         quality = item['quality']
         if item['media_type'] == 'Audio':
             quality = f"{item.get('audio_format', '')} {quality}"
+        if item.get('playlist_items'):
+            quality += f" · #{item['playlist_items']}"
         self.queue_tree.insert('', tk.END, iid=item['id'],
                                values=(item.get('title') or item['url'], item['url'],
                                        item['media_type'], quality, "Queued"))
@@ -568,22 +965,27 @@ class YouTubeDownloaderUI:
         for iid in rows:
             status = self.queue_tree.set(iid, 'status').split(' ')[0]
             counts[status] = counts.get(status, 0) + 1
-        parts = [f"{counts[k]} {k.lower()}" for k in ('Queued', 'Downloading', 'Complete', 'Failed', 'Cancelled')
+        parts = [f"{counts[k]} {k.lower()}" for k in ('Queued', 'Downloading', 'Paused', 'Complete',
+                                                      'Failed', 'Cancelled')
                  if counts.get(k)]
         self.queue_summary.config(text=" · ".join(parts))
 
     def remove_selected(self) -> None:
+        skipped = 0
         for iid in self.queue_tree.selection():
-            if iid == self.current_item_id:
+            if iid in self.active_ids:
+                skipped += 1
                 continue
             self.queue_tree.delete(iid)
             self.queue_handler('remove', iid)
+        if skipped:
+            self.set_status("Items that are downloading must be cancelled or paused first", 'orange')
         self._refresh_queue_summary()
 
     def clear_queue(self) -> None:
         """Clear everything except the item currently downloading."""
         for iid in self.queue_tree.get_children():
-            if iid != self.current_item_id:
+            if iid not in self.active_ids:
                 self.queue_tree.delete(iid)
         self.queue_handler('clear', None)
         self._refresh_queue_summary()
@@ -591,7 +993,7 @@ class YouTubeDownloaderUI:
     def clear_completed(self) -> None:
         """Remove finished rows (complete, failed or cancelled)."""
         for iid in self.queue_tree.get_children():
-            if self.queue_tree.set(iid, 'status') in ('Complete', 'Failed', 'Cancelled'):
+            if self.queue_tree.set(iid, 'status') in FINISHED_STATUSES:
                 self.queue_tree.delete(iid)
                 self.queue_handler('remove', iid)
         self._refresh_queue_summary()
@@ -600,7 +1002,12 @@ class YouTubeDownloaderUI:
         if not self.queue_tree.exists(item_id):
             return
         self.queue_tree.set(item_id, 'status', status)
-        self.current_item_id = item_id if status == 'Downloading' else None
+        if status == 'Downloading':
+            self.active_ids.add(item_id)
+        else:
+            self.active_ids.discard(item_id)
+            self.item_progress.pop(item_id, None)
+            self.item_speed.pop(item_id, None)
         tag = STATUS_TAGS.get(status)
         self.queue_tree.item(item_id, tags=(tag,) if tag else ())
         if status == 'Downloading':
@@ -610,6 +1017,31 @@ class YouTubeDownloaderUI:
     def update_queue_item_title(self, item_id: str, title: str) -> None:
         if self.queue_tree.exists(item_id):
             self.queue_tree.set(item_id, 'title', title)
+
+    def pause_selected(self) -> None:
+        paused = sum(1 for iid in self.queue_tree.selection()
+                     if self.queue_tree.set(iid, 'status').split(' ')[0] in ('Queued', 'Downloading')
+                     and self.queue_handler('pause', iid))
+        if paused:
+            self.set_status(f"Pausing {paused} item(s) — partial downloads are kept", 'orange', reset_after=4000)
+
+    def resume_selected(self) -> None:
+        resumed = 0
+        for iid in self.queue_tree.selection():
+            status = self.queue_tree.set(iid, 'status')
+            if status == 'Paused':
+                resumed += bool(self.queue_handler('resume', iid))
+            elif status in ('Failed', 'Cancelled'):
+                resumed += bool(self.queue_handler('retry', iid))
+        if resumed:
+            self.set_status(f"Resuming {resumed} item(s)", 'black', reset_after=4000)
+        else:
+            self.set_status("Select paused, failed or cancelled items to resume", 'orange', reset_after=4000)
+
+    def cancel_selected(self) -> None:
+        for iid in self.queue_tree.selection():
+            if iid in self.active_ids:
+                self.queue_handler('cancel_item', iid)
 
     def _show_context_menu(self, event: tk.Event) -> None:
         row = self.queue_tree.identify_row(event.y)
@@ -651,8 +1083,9 @@ class YouTubeDownloaderUI:
         self.start_download()
 
     def start_download(self) -> None:
-        self.progress_bar['value'] = 0
-        self.stats_label.config(text="")
+        if not self.downloading:
+            self.progress_bar['value'] = 0
+            self.stats_label.config(text="")
         self.set_status("Starting…", 'black')
         self.download_handler('start')
 
@@ -666,11 +1099,22 @@ class YouTubeDownloaderUI:
         else:
             self.download_btn.config(text="Start downloads", style='Accent.TButton', state=tk.NORMAL)
 
-    def update_progress(self, percent: float, speed: str, eta: str, size: str) -> None:
-        self.progress_bar['value'] = percent
-        self.stats_label.config(text=f"{percent:.1f}%  ·  {speed}  ·  ETA {eta}  ·  {size}")
-        if self.current_item_id and self.queue_tree.exists(self.current_item_id):
-            self.queue_tree.set(self.current_item_id, 'status', f"Downloading {percent:.0f}%")
+    def update_progress(self, item_id: str, percent: float, speed: str, eta: str, size: str,
+                        speed_bps: float = 0.0) -> None:
+        if item_id not in self.active_ids:
+            return
+        self.item_progress[item_id] = percent
+        self.item_speed[item_id] = speed_bps
+        if self.queue_tree.exists(item_id):
+            self.queue_tree.set(item_id, 'status', f"Downloading {percent:.0f}%")
+
+        active = len(self.item_progress)
+        self.progress_bar['value'] = sum(self.item_progress.values()) / active
+        if active == 1:
+            self.stats_label.config(text=f"{percent:.1f}%  ·  {speed}  ·  ETA {eta}  ·  {size}")
+        else:
+            total_speed = format_bytes(sum(self.item_speed.values()))
+            self.stats_label.config(text=f"{active} downloads  ·  {total_speed}/s total")
 
     def download_complete(self, success: bool) -> None:
         if success:
@@ -686,7 +1130,9 @@ class YouTubeDownloaderUI:
     def reset_ui(self) -> None:
         self.downloading = False
         self.cancel_requested = False
-        self.current_item_id = None
+        self.active_ids.clear()
+        self.item_progress.clear()
+        self.item_speed.clear()
         self.update_download_state(False, False)
         self._refresh_queue_summary()
 

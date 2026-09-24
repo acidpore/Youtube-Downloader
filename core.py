@@ -1,17 +1,17 @@
-import os
-import re
+import glob
 import json
 import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
 import threading
 import time
-import subprocess
-import glob
-import shutil
-import sys
 import uuid
-from collections import deque, OrderedDict
-from typing import Optional, Callable, Any, Dict, List
+from collections import OrderedDict, deque
 from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Regular expression to strip ANSI escape codes from progress strings.
 ANSI_REGEX = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
@@ -23,19 +23,8 @@ LOGGER = logging.getLogger(__name__)
 YoutubeDL = None
 DownloadError = None
 
-# Minimum seconds between progress callbacks sent to the UI.
+# Minimum seconds between progress callbacks sent to the UI, per item.
 PROGRESS_INTERVAL = 0.1
-
-
-def _ensure_yt_dlp() -> None:
-    """Import yt-dlp on first use."""
-    global YoutubeDL, DownloadError
-    if YoutubeDL is None or DownloadError is None:
-        import yt_dlp
-        if YoutubeDL is None:
-            YoutubeDL = yt_dlp.YoutubeDL
-        if DownloadError is None:
-            DownloadError = yt_dlp.utils.DownloadError
 
 # Supported YouTube URLs: watch, shorts, live, embed, playlist, youtu.be,
 # on www/m/music subdomains.
@@ -49,8 +38,28 @@ YOUTUBE_URL_REGEX = re.compile(
 )
 
 
-class DownloadCancelled(Exception):
-    """Raised from the progress hook to abort the running yt-dlp download."""
+def _ensure_yt_dlp() -> None:
+    """Import yt-dlp on first use."""
+    global YoutubeDL, DownloadError
+    if YoutubeDL is None or DownloadError is None:
+        import yt_dlp
+        if YoutubeDL is None:
+            YoutubeDL = yt_dlp.YoutubeDL
+        if DownloadError is None:
+            DownloadError = yt_dlp.utils.DownloadError
+
+
+def is_frozen() -> bool:
+    """True when running from a PyInstaller build."""
+    return bool(getattr(sys, 'frozen', False))
+
+
+def _bundle_dir() -> str:
+    """Folder holding bundled files (FFmpeg) in a packaged build."""
+    if is_frozen():
+        return getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
 
 def _app_data_dir() -> str:
     """Per-user folder for config, queue, history and log files."""
@@ -63,6 +72,14 @@ def _app_data_dir() -> str:
     return path
 
 
+class DownloadCancelled(Exception):
+    """Raised from the progress hook to abort the running yt-dlp download."""
+
+
+class DownloadPaused(DownloadCancelled):
+    """Like DownloadCancelled, but partial files are kept for resuming."""
+
+
 class Config:
     """Application configuration constants."""
     APP_DIR = _app_data_dir()
@@ -72,16 +89,20 @@ class Config:
     LOG_FILE = os.path.join(APP_DIR, 'yt_downloader.log')
     DEFAULT_DOWNLOAD_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "YouTube")
     FFMPEG_CANDIDATES = (
+        os.path.join(_bundle_dir(), 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'),
+        os.path.join(_bundle_dir(), 'ffmpeg', 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'),
         '/usr/bin/ffmpeg',
         '/usr/local/bin/ffmpeg',
         '/opt/homebrew/bin/ffmpeg',
-        'C:\ffmpeg\bin\ffmpeg.exe',
+        r'C:\ffmpeg\bin\ffmpeg.exe',
     )
 
     MEDIA_TYPES = ('Video', 'Audio')
     VIDEO_QUALITIES = ('Best', '1080p', '720p', '480p', '360p')
     AUDIO_QUALITIES = ('128k', '192k', '256k', '320k')
     AUDIO_FORMATS = ('mp3', 'aac', 'wav', 'm4a')
+    COOKIE_BROWSERS = ('', 'chrome', 'firefox', 'edge', 'brave', 'opera', 'vivaldi', 'chromium', 'safari')
+    MAX_CONCURRENT = 3
 
 
 class DownloadState:
@@ -89,7 +110,6 @@ class DownloadState:
     def __init__(self):
         self.downloading = False
         self.cancelled = False
-        self.current_item = None
         self.observers: List[Callable] = []
 
     def update_state(self, downloading: bool, cancelled: bool = False):
@@ -103,6 +123,7 @@ class DownloadState:
     def _notify_observers(self):
         for observer in self.observers:
             observer(self.downloading, self.cancelled)
+
 
 class DownloadHistory:
     """Persists a bounded list of finished downloads."""
@@ -146,7 +167,8 @@ class DownloadHistory:
 
 class DownloadManager:
     """
-    Manages the download queue and performs YouTube downloads using yt-dlp.
+    Manages the download queue and runs YouTube downloads with yt-dlp,
+    several at a time (config 'max_concurrent').
     """
     CONFIG_FILE: str = Config.CONFIG_FILE
     QUEUE_FILE: str = Config.QUEUE_FILE
@@ -158,20 +180,24 @@ class DownloadManager:
     AUDIO_FORMATS = Config.AUDIO_FORMATS
 
     def __init__(self) -> None:
-        """
-        Initializes the download manager, including configuration, queue, and logging.
-        """
         self._migrate_legacy_files()
         self.config: OrderedDict = self.load_config()
-        self.download_queue: deque[Dict[str, Any]] = deque()
         self.state = DownloadState()
         self.history = DownloadHistory()
-        self.queue_lock = threading.Lock()
-        self.current_download: Optional[Any] = None
-        self._last_progress = 0.0
+        self.queue_lock = threading.RLock()
 
-        # Callback functions for UI feedback
-        self.on_progress: Optional[Callable[[float, str, str, str], None]] = None
+        # Item bookkeeping (all guarded by queue_lock).
+        self.download_queue: deque = deque()          # waiting to start
+        self.active: Dict[str, Dict[str, Any]] = {}   # downloading now
+        self.paused: Dict[str, Dict[str, Any]] = {}   # paused, .part files kept
+        self.finished: Dict[str, Dict[str, Any]] = {}  # failed/cancelled, for retry
+        self._stop_requests: Dict[str, str] = {}      # item id -> 'pause' | 'cancel'
+        self._workers = 0
+        self._failed_in_run = 0
+        self._last_progress: Dict[str, float] = {}
+
+        # Callbacks for UI feedback. They are called from worker threads.
+        self.on_progress: Optional[Callable[[str, float, str, str, str, float], None]] = None
         self.on_status: Optional[Callable[[str, str], None]] = None
         self.on_complete: Optional[Callable[[bool], None]] = None
         self.on_item_status: Optional[Callable[[str, str], None]] = None
@@ -192,9 +218,7 @@ class DownloadManager:
                     LOGGER.error(f"Could not migrate {legacy}: {e}")
 
     def setup_logging(self) -> None:
-        """
-        Sets up logging to a file with INFO level.
-        """
+        """Log to Config.LOG_FILE (attached once, even with several managers)."""
         root_logger = logging.getLogger()
         log_path = os.path.abspath(Config.LOG_FILE)
         already_attached = any(
@@ -214,11 +238,7 @@ class DownloadManager:
     # ==============================
 
     def load_config(self) -> OrderedDict:
-        """
-        Loads and validates configuration from the config file.
-
-        :return: An OrderedDict containing configuration parameters.
-        """
+        """Load the config file (if any) and fill in validated defaults."""
         config: dict = {}
         try:
             if os.path.exists(self.CONFIG_FILE):
@@ -232,115 +252,161 @@ class DownloadManager:
         return self.validate_config(config)
 
     def validate_config(self, config: dict) -> OrderedDict:
-        """
-        Validates and sets default configuration values with improved path handling.
-        """
+        """Return a config with every key present and every value valid."""
         validated = OrderedDict()
-        
+
         default_download_path = Config.DEFAULT_DOWNLOAD_PATH
-        
-        # Validate and create download path if it doesn't exist
-        download_path = config.get('download_path', default_download_path)
+        download_path = config.get('download_path') or default_download_path
         try:
             os.makedirs(download_path, exist_ok=True)
             validated['download_path'] = download_path
-        except Exception as e:
+        except OSError as e:
             logging.error(f"Error creating download directory: {e}")
             validated['download_path'] = default_download_path
-        
-        # Try to find FFmpeg in common locations
-        ffmpeg_path = config.get('ffmpeg_path', '')
+
         # Cheap existence check only; the full `ffmpeg -version` check runs
         # when a download is started (validate_paths).
+        ffmpeg_path = config.get('ffmpeg_path', '')
         if not self._ffmpeg_exists(ffmpeg_path):
             ffmpeg_path = self.find_ffmpeg(verify=False) or ffmpeg_path
-                
         validated['ffmpeg_path'] = ffmpeg_path
-        
-        # Validate media options
-        validated['theme'] = self._validate_value(config.get('theme'), ('light', 'dark'), 'light')
-        validated['media_type'] = self._validate_value(config.get('media_type'), self.MEDIA_TYPES, 'Video')
-        validated['video_resolution'] = self._validate_value(config.get('video_resolution'), self.VIDEO_QUALITIES, 'Best')
-        validated['audio_quality'] = self._validate_value(config.get('audio_quality'), self.AUDIO_QUALITIES, '128k')
-        validated['audio_format'] = self._validate_value(config.get('audio_format'), self.AUDIO_FORMATS, 'mp3')
-        
+
+        v = self._validate_value
+        validated['theme'] = v(config.get('theme'), ('light', 'dark'), 'light')
+        validated['media_type'] = v(config.get('media_type'), self.MEDIA_TYPES, 'Video')
+        validated['video_resolution'] = v(config.get('video_resolution'), self.VIDEO_QUALITIES, 'Best')
+        validated['audio_quality'] = v(config.get('audio_quality'), self.AUDIO_QUALITIES, '192k')
+        validated['audio_format'] = v(config.get('audio_format'), self.AUDIO_FORMATS, 'mp3')
+
+        validated['max_concurrent'] = self._validate_int(config.get('max_concurrent'), 1, Config.MAX_CONCURRENT, 2)
+        validated['rate_limit_kb'] = self._validate_int(config.get('rate_limit_kb'), 0, 1_000_000, 0)
+        validated['embed_subtitles'] = self._validate_bool(config.get('embed_subtitles'), False)
+        langs = config.get('subtitle_langs')
+        validated['subtitle_langs'] = langs.strip() if isinstance(langs, str) and langs.strip() else 'en,id'
+        validated['embed_thumbnail'] = self._validate_bool(config.get('embed_thumbnail'), True)
+        validated['add_metadata'] = self._validate_bool(config.get('add_metadata'), True)
+        validated['cookies_browser'] = v(config.get('cookies_browser'), Config.COOKIE_BROWSERS, '')
+        validated['watch_clipboard'] = self._validate_bool(config.get('watch_clipboard'), True)
         return validated
 
-    def _validate_value(self, value: Any, valid_values: tuple, default: Any) -> Any:
-        """
-        Validates that a value is within the accepted options.
-
-        :param value: The value to validate.
-        :param valid_values: A tuple of valid options.
-        :param default: The default value if validation fails.
-        :return: The original value if valid, otherwise the default.
-        """
+    @staticmethod
+    def _validate_value(value: Any, valid_values: tuple, default: Any) -> Any:
         return value if value in valid_values else default
 
-    def save_config(self) -> None:
-        """
-        Saves the current configuration to a file.
-        """
+    @staticmethod
+    def _validate_int(value: Any, low: int, high: int, default: int) -> int:
+        if isinstance(value, bool):
+            return default
         try:
-            with open(self.CONFIG_FILE, 'w') as f:
+            number = int(value)
+        except (TypeError, ValueError):
+            return default
+        return number if low <= number <= high else default
+
+    @staticmethod
+    def _validate_bool(value: Any, default: bool) -> bool:
+        return value if isinstance(value, bool) else default
+
+    def update_config(self, key: str, value: Any) -> None:
+        """Set one config value (validated) and save."""
+        candidate = dict(self.config)
+        candidate[key] = value
+        self.config[key] = self.validate_config(candidate).get(key, value)
+        self.save_config()
+
+    def save_config(self) -> None:
+        try:
+            with open(self.CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=2)
             logging.info("Configuration saved successfully.")
-        except Exception as e:
+        except OSError as e:
             logging.error(f"Config save failed: {str(e)}")
 
     # ==============================
     # Queue Management
     # ==============================
 
+    @staticmethod
+    def _public(item: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy of an item without runtime-only keys (those start with '_')."""
+        return {k: v for k, v in item.items() if not k.startswith('_')}
+
     def _load_queue_state(self) -> None:
-        """Load saved queue state from file."""
         try:
-            if os.path.exists(self.QUEUE_FILE):
-                with open(self.QUEUE_FILE, 'r') as f:
-                    queue_items = json.load(f)
-                for item in queue_items:
-                    if item.get('status') != 'Complete':
-                        item.setdefault('id', uuid.uuid4().hex)
-                        self.download_queue.append(item)
-        except Exception as e:
+            if not os.path.exists(self.QUEUE_FILE):
+                return
+            with open(self.QUEUE_FILE, 'r', encoding='utf-8') as f:
+                queue_items = json.load(f)
+            for item in queue_items:
+                if not isinstance(item, dict) or 'url' not in item:
+                    continue
+                item.setdefault('id', uuid.uuid4().hex)
+                if item.get('state') == 'paused':
+                    self.paused[item['id']] = item
+                else:
+                    item['state'] = 'queued'
+                    self.download_queue.append(item)
+        except (OSError, ValueError) as e:
             LOGGER.error(f"Error loading queue state: {e}")
 
     def _save_queue_state(self) -> None:
-        """Save current queue state to file."""
+        """Persist waiting, active and paused items so they survive a restart."""
+        with self.queue_lock:
+            items = [dict(self._public(i), state='queued') for i in self.active.values()]
+            items += [dict(self._public(i), state='queued') for i in self.download_queue]
+            items += [dict(self._public(i), state='paused') for i in self.paused.values()]
         try:
-            queue_items = list(self.download_queue)
-            with open(self.QUEUE_FILE, 'w') as f:
-                json.dump(queue_items, f)
-        except Exception as e:
+            with open(self.QUEUE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(items, f)
+        except OSError as e:
             LOGGER.error(f"Error saving queue state: {e}")
 
     def add_to_queue(self, item: Dict[str, Any]) -> bool:
-        """Add an item to the download queue."""
         with self.queue_lock:
             item.setdefault('id', uuid.uuid4().hex)
+            item['state'] = 'queued'
             self.download_queue.append(item)
-            self._save_queue_state()
-            return True
+        self._save_queue_state()
+        return True
 
     def get_queue(self) -> List[Dict[str, Any]]:
-        """Return a snapshot of the pending queue items."""
+        """Waiting items (not yet started), in order."""
         with self.queue_lock:
             return list(self.download_queue)
 
-    def remove_from_queue(self, item_id: str) -> None:
-        """Remove the pending item with the given id from the download queue."""
+    def get_items(self) -> List[Dict[str, Any]]:
+        """Every item the UI should show on startup: waiting and paused."""
         with self.queue_lock:
-            for item in self.download_queue:
+            return list(self.download_queue) + list(self.paused.values())
+
+    def update_item(self, item_id: str, **fields: Any) -> bool:
+        """Change fields (e.g. playlist_items) of a waiting, paused or finished item."""
+        with self.queue_lock:
+            item = next((i for i in self.download_queue if i['id'] == item_id), None) \
+                or self.paused.get(item_id) or self.finished.get(item_id)
+            if item is None:
+                return False
+            item.update(fields)
+        self._save_queue_state()
+        return True
+
+    def remove_from_queue(self, item_id: str) -> None:
+        """Remove a waiting, paused or finished item. Active items must be cancelled first."""
+        with self.queue_lock:
+            for item in list(self.download_queue):
                 if item.get('id') == item_id:
                     self.download_queue.remove(item)
-                    self._save_queue_state()
-                    break
+            self.paused.pop(item_id, None)
+            self.finished.pop(item_id, None)
+        self._save_queue_state()
 
     def clear_queue(self) -> None:
-        """Clear the entire download queue."""
+        """Remove every waiting and paused item (active downloads keep running)."""
         with self.queue_lock:
             self.download_queue.clear()
-            self._save_queue_state()
+            self.paused.clear()
+            self.finished.clear()
+        self._save_queue_state()
 
     # ==============================
     # Download Control
@@ -351,109 +417,187 @@ class DownloadManager:
         threading.Thread(target=_ensure_yt_dlp, daemon=True).start()
 
     def start_download(self) -> None:
-        """
-        Initiates the download process in a separate thread.
-        """
-        if not self.download_queue:
-            logging.info("Download queue is empty. Nothing to start.")
-            return
-
-        self.state.update_state(True)
-        threading.Thread(target=self.process_queue, daemon=True).start()
-        logging.info("Download process started.")
+        """Start (or top up) worker threads for the waiting items."""
+        with self.queue_lock:
+            if not self.download_queue:
+                logging.info("Download queue is empty. Nothing to start.")
+                return
+            starting = not self.state.downloading
+            if starting:
+                self._failed_in_run = 0
+                self.state.update_state(True)
+            wanted = min(self.config.get('max_concurrent', 1), len(self.download_queue) + len(self.active))
+            new_workers = max(wanted - self._workers, 0)
+            self._workers += new_workers
+        for _ in range(new_workers):
+            threading.Thread(target=self._worker, daemon=True).start()
+        logging.info(f"Download process started ({new_workers} new worker(s)).")
 
     def cancel_download(self) -> None:
-        """
-        Signals the current download to stop. The running download is aborted
-        from within progress_hook, which raises DownloadCancelled.
-        """
-        self.state.update_state(self.state.downloading, True)
+        """Cancel everything that is downloading; waiting items stay queued."""
+        with self.queue_lock:
+            if not self.state.downloading:
+                return
+            for item_id in self.active:
+                self._stop_requests[item_id] = 'cancel'
+            self.state.update_state(True, True)
         logging.info("Cancellation requested.")
         if self.on_status:
-            self.on_status("Cancelling download...", "orange")
+            self.on_status("Cancelling…", "orange")
 
-    def _remove_partial_files(self, item: Dict[str, Any]) -> None:
-        """Delete yt-dlp partial download files left in the item's folder."""
-        for partial_file in glob.glob(os.path.join(glob.escape(item['path']), '*.part')):
-            try:
-                os.remove(partial_file)
-            except OSError:
-                pass
+    def cancel_item(self, item_id: str) -> None:
+        """Cancel one active download."""
+        with self.queue_lock:
+            if item_id in self.active:
+                self._stop_requests[item_id] = 'cancel'
 
-    def _set_item_status(self, item: Dict[str, Any], status: str) -> None:
+    def pause_item(self, item_id: str) -> bool:
+        """Pause an active or waiting item. Returns True if something was paused."""
+        with self.queue_lock:
+            if item_id in self.active:
+                self._stop_requests[item_id] = 'pause'
+                return True
+            for item in list(self.download_queue):
+                if item['id'] == item_id:
+                    self.download_queue.remove(item)
+                    item['state'] = 'paused'
+                    self.paused[item_id] = item
+                    break
+            else:
+                return False
+        self._set_item_status(item_id, 'Paused')
+        self._save_queue_state()
+        return True
+
+    def resume_item(self, item_id: str) -> bool:
+        """Put a paused item back at the front of the queue and start downloading."""
+        with self.queue_lock:
+            item = self.paused.pop(item_id, None)
+            if item is None:
+                return False
+            item['state'] = 'queued'
+            self.download_queue.appendleft(item)
+        self._set_item_status(item_id, 'Queued')
+        self._save_queue_state()
+        self.start_download()
+        return True
+
+    def retry_item(self, item_id: str) -> bool:
+        """Queue a failed or cancelled item again and start downloading."""
+        with self.queue_lock:
+            item = self.finished.pop(item_id, None)
+            if item is None:
+                return False
+            item['state'] = 'queued'
+            self.download_queue.append(item)
+        self._set_item_status(item_id, 'Queued')
+        self._save_queue_state()
+        self.start_download()
+        return True
+
+    def _set_item_status(self, item_id: str, status: str) -> None:
         if self.on_item_status:
-            self.on_item_status(item.get('id'), status)
+            self.on_item_status(item_id, status)
 
-    def process_queue(self) -> None:
-        """
-        Processes items in the download queue until cancelled or the queue is empty.
-        Calls the on_complete callback once processing finishes.
-        """
-        failed = 0
-        while not self.state.cancelled:
+    def _worker(self) -> None:
+        """Take items from the queue until it is empty or everything is cancelled."""
+        while True:
             with self.queue_lock:
-                if not self.download_queue:
-                    logging.info("Download queue exhausted.")
+                if self.state.cancelled or not self.download_queue or \
+                        len(self.active) >= self.config.get('max_concurrent', 1):
                     break
                 item = self.download_queue.popleft()
-                self.state.current_item = item
-                self._save_queue_state()
+                item['state'] = 'active'
+                item['_files'] = set()
+                self.active[item['id']] = item
+            self._save_queue_state()
+            self._run_item(item)
 
-            self._set_item_status(item, "Downloading")
-            try:
-                ok = self.run_download(item)
-            except DownloadCancelled:
-                ok = None
-            except Exception as e:
-                logging.error(f"Download error for {item.get('url')}: {str(e)}")
-                if self.on_status:
-                    self.on_status(f"Download failed: {self.parse_error(e)}", "red")
-                ok = False
+        with self.queue_lock:
+            self._workers -= 1
+            last = self._workers == 0
+            if last:
+                cancelled = self.state.cancelled
+                failed = self._failed_in_run
+                self.state.update_state(False, cancelled)
+        if last:
+            if self.on_status and cancelled:
+                self.on_status("Downloads cancelled", "orange")
+            if self.on_complete:
+                # Success only when nothing failed and the user did not cancel.
+                self.on_complete(failed == 0 and not cancelled)
+            logging.info("Download processing completed.")
 
-            status = {None: 'Cancelled', True: 'Complete', False: 'Failed'}[ok]
-            fmt = item.get('quality', '') if item.get('media_type') == 'Video' else item.get('audio_format', '')
-            self.history.add_entry(item.get('url'), item.get('title', item.get('url')), fmt, status)
+    def _run_item(self, item: Dict[str, Any]) -> None:
+        item_id = item['id']
+        self._set_item_status(item_id, 'Downloading')
+        result = 'Failed'
+        try:
+            result = 'Complete' if self.run_download(item) else 'Failed'
+        except DownloadPaused:
+            result = 'Paused'
+        except DownloadCancelled:
+            result = 'Cancelled'
+        except Exception as e:
+            logging.error(f"Download error for {item.get('url')}: {str(e)}")
+            if self.on_status:
+                self.on_status(f"Download failed: {self.parse_error(e)}", "red")
 
-            if ok is None:
-                self._remove_partial_files(item)
-                self._set_item_status(item, "Cancelled")
-                logging.info(f"Download cancelled: {item.get('url')}")
-            elif ok:
-                self._set_item_status(item, "Complete")
-            else:
-                failed += 1
-                self._set_item_status(item, "Failed")
+        with self.queue_lock:
+            self.active.pop(item_id, None)
+            self._stop_requests.pop(item_id, None)
+            self._last_progress.pop(item_id, None)
+            files = item.pop('_files', set())
+            if result == 'Paused':
+                item['state'] = 'paused'
+                self.paused[item_id] = item
+            elif result in ('Failed', 'Cancelled'):
+                item['state'] = result.lower()
+                self.finished[item_id] = item
+            if result == 'Failed':
+                self._failed_in_run += 1
+        self._save_queue_state()
 
-            self.state.current_item = None
-            self.current_download = None
+        if result == 'Cancelled':
+            self._remove_partial_files(files)
+        if result != 'Paused':
+            fmt = item.get('quality', '') if item.get('media_type') == 'Video' \
+                else f"{item.get('audio_format', '')} {item.get('quality', '')}"
+            self.history.add_entry(item.get('url'), item.get('title') or item.get('url'), fmt, result)
+        logging.info(f"{result}: {item.get('url')}")
+        self._set_item_status(item_id, result)
 
-        cancelled = self.state.cancelled
-        self.state.update_state(False, cancelled)
-        if self.on_status and cancelled:
-            self.on_status("Download cancelled", "orange")
-        if self.on_complete:
-            # Success only when nothing failed and the user did not cancel.
-            self.on_complete(failed == 0 and not cancelled)
-        logging.info("Download processing completed.")
+    @staticmethod
+    def _remove_partial_files(files: set) -> None:
+        """Delete the partial files of one cancelled download (not other downloads')."""
+        for name in files:
+            for path in {name, name + '.part', name + '.ytdl'} | set(glob.glob(glob.escape(name) + '.part-Frag*')):
+                if path.endswith(('.part', '.ytdl')) or '.part-Frag' in path:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+    def _check_stop(self, item: Dict[str, Any]) -> None:
+        """Raise if this item (or everything) should stop."""
+        request = self._stop_requests.get(item['id'])
+        if request == 'pause':
+            raise DownloadPaused()
+        if request == 'cancel' or self.state.cancelled:
+            raise DownloadCancelled()
 
     def run_download(self, item: Dict[str, Any]) -> bool:
         """
         Downloads a single item, retrying up to MAX_RETRIES times.
 
         :return: True on success, False on permanent failure.
-        :raises DownloadCancelled: if the user cancelled the download.
+        :raises DownloadCancelled / DownloadPaused: if the user stopped it.
         """
         for attempt in range(1, self.MAX_RETRIES + 1):
-            if self.state.cancelled:
-                raise DownloadCancelled()
-
+            self._check_stop(item)
             try:
                 _ensure_yt_dlp()
-                ydl_opts = self.build_ydl_opts(item)
-                with YoutubeDL(ydl_opts) as ydl:
-                    self.current_download = ydl
-                    
-                    # Extract info first to validate video availability
+                with YoutubeDL(self.build_ydl_opts(item)) as ydl:
                     try:
                         # process=False only resolves metadata (cheap for playlists).
                         info = ydl.extract_info(item['url'], download=False, process=False)
@@ -466,77 +610,80 @@ class DownloadManager:
 
                     item['title'] = info.get('title') or item['url']
                     if self.on_item_title:
-                        self.on_item_title(item.get('id'), item['title'])
-                    if self.on_status:
-                        self.on_status(f"Downloading: {item['title']}", "black")
-
-                    # Perform the actual download
+                        self.on_item_title(item['id'], item['title'])
+                    self._check_stop(item)
                     ydl.download([item['url']])
-                    
-                    if self.on_status:
-                        self.on_status(f"Successfully downloaded: {info.get('title', item['url'])}", "green")
-                        
-                    logging.info(f"Download completed: {item.get('url')}")
-                    return True
 
+                if self.on_status:
+                    self.on_status(f"Downloaded: {item['title']}", "green")
+                return True
+
+            except DownloadCancelled:
+                raise
             except Exception as e:
-                if self.state.cancelled or isinstance(e, DownloadCancelled):
-                    raise DownloadCancelled()
+                self._check_stop(item)
                 error_msg = str(e)
-                
-                # Check for specific error conditions
+
                 if 'HTTP Error 429' in error_msg:
-                    delay = min(60 * attempt, 300)  # Max 5 minute delay
+                    delay = min(60 * attempt, 300)
                     if self.on_status:
-                        self.on_status(f"Rate limited. Waiting {delay} seconds...", "orange")
-                    self._interruptible_sleep(delay)
+                        self.on_status(f"Rate limited by YouTube. Waiting {delay} seconds…", "orange")
+                    self._interruptible_sleep(item, delay)
                     continue
-                    
+
                 if attempt < self.MAX_RETRIES:
                     delay = self.RETRY_DELAY * attempt
                     if self.on_status:
-                        self.on_status(f"Download failed. Retrying in {delay} seconds... ({attempt}/{self.MAX_RETRIES})", "orange")
-                    self._interruptible_sleep(delay)
+                        self.on_status(f"Download failed. Retrying in {delay} seconds… "
+                                       f"({attempt}/{self.MAX_RETRIES})", "orange")
+                    self._interruptible_sleep(item, delay)
                 else:
-                    logging.error(f"All attempts failed for {item.get('url')}")
+                    logging.error(f"All attempts failed for {item.get('url')}: {error_msg}")
                     if self.on_status:
-                        self.on_status(f"Download failed after {self.MAX_RETRIES} attempts: {self.parse_error(e)}", "red")
+                        self.on_status(f"Download failed: {self.parse_error(e)}", "red")
                     return False
         return False
 
-    def _interruptible_sleep(self, seconds: float) -> None:
-        """Sleep for the given time, waking early (and raising) on cancel."""
+    def _interruptible_sleep(self, item: Dict[str, Any], seconds: float) -> None:
+        """Sleep, but wake up (and raise) as soon as the item is paused or cancelled."""
         end = time.time() + seconds
         while time.time() < end:
-            if self.state.cancelled:
-                raise DownloadCancelled()
+            self._check_stop(item)
             time.sleep(0.2)
 
     def build_ydl_opts(self, item: Dict[str, Any]) -> dict:
-        """
-        Builds and returns the yt-dlp options based on the download item.
-
-        :param item: A dictionary with download parameters.
-        :return: A dictionary of options for YoutubeDL.
-        """
-        if self.is_playlist_url(item['url']):
+        """Build the yt-dlp options for one queue item from it and the global config."""
+        playlist = self.is_playlist_url(item['url'])
+        if playlist:
             # Keep each playlist in its own folder, in playlist order.
             name = os.path.join('%(playlist_title)s', '%(playlist_index)03d - %(title)s [%(id)s].%(ext)s')
         else:
             name = '%(title)s [%(id)s].%(ext)s'
+        cfg = self.config
         opts: dict = {
             'outtmpl': os.path.join(item['path'], name),
-            'noplaylist': not self.is_playlist_url(item['url']),
-            'ignoreerrors': 'only_download' if self.is_playlist_url(item['url']) else False,
+            'noplaylist': not playlist,
+            'ignoreerrors': 'only_download' if playlist else False,
             'quiet': True,
             'no_warnings': True,
-            'ffmpeg_location': item['ffmpeg_path'],
-            'progress_hooks': [self.progress_hook],
+            'noprogress': True,
+            'ffmpeg_location': item.get('ffmpeg_path') or cfg.get('ffmpeg_path') or None,
+            'progress_hooks': [lambda d, item=item: self.progress_hook(item, d)],
             'retries': 10,
             'fragment_retries': 10,
-            'skip_unavailable_fragments': True
+            'skip_unavailable_fragments': True,
+            'continuedl': True,
         }
+        if item.get('playlist_items'):
+            opts['playlist_items'] = item['playlist_items']
 
+        # A total speed limit is shared between the parallel downloads.
+        if cfg.get('rate_limit_kb'):
+            opts['ratelimit'] = cfg['rate_limit_kb'] * 1024 // max(cfg.get('max_concurrent', 1), 1)
+        if cfg.get('cookies_browser'):
+            opts['cookiesfrombrowser'] = (cfg['cookies_browser'],)
+
+        postprocessors: List[dict] = []
         if item['media_type'] == 'Video':
             # Any codec is allowed so 1440p/4K (VP9/AV1) is not skipped;
             # the result is merged into an MP4 container.
@@ -546,143 +693,203 @@ class DownloadManager:
                 res = item['quality'].rstrip('p')
                 opts['format'] = f'bestvideo[height<={res}]+bestaudio/best[height<={res}]/best'
             opts['merge_output_format'] = 'mp4'
+            if cfg.get('embed_subtitles'):
+                opts['writesubtitles'] = True
+                opts['writeautomaticsub'] = True
+                opts['subtitleslangs'] = [lang.strip() for lang in cfg.get('subtitle_langs', 'en').split(',')
+                                          if lang.strip()]
+                postprocessors.append({'key': 'FFmpegEmbedSubtitle', 'already_have_subtitle': False})
         else:
             opts['format'] = 'bestaudio/best'
-            opts['postprocessors'] = [{
+            postprocessors.append({
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': item['audio_format'],
-                'preferredquality': item['quality'].rstrip('k')
-            }]
+                'preferredquality': item['quality'].rstrip('k'),
+            })
 
+        if cfg.get('add_metadata'):
+            postprocessors.append({'key': 'FFmpegMetadata', 'add_metadata': True})
+        # WAV has no cover-art support.
+        if cfg.get('embed_thumbnail') and not (item['media_type'] == 'Audio' and item['audio_format'] == 'wav'):
+            opts['writethumbnail'] = True
+            postprocessors.append({'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg', 'when': 'before_dl'})
+            postprocessors.append({'key': 'EmbedThumbnail', 'already_have_thumbnail': False})
+        if postprocessors:
+            opts['postprocessors'] = postprocessors
         return opts
+
+    # ==============================
+    # Video information (preview)
+    # ==============================
+
+    def fetch_info(self, url: str) -> Dict[str, Any]:
+        """
+        Fetch metadata for the preview dialog without downloading.
+        Playlists are listed flat (titles only) so this stays fast.
+        """
+        _ensure_yt_dlp()
+        opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
+                'noplaylist': not self.is_playlist_url(url), 'extract_flat': 'in_playlist'}
+        if self.config.get('cookies_browser'):
+            opts['cookiesfrombrowser'] = (self.config['cookies_browser'],)
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        summary = {
+            'title': info.get('title') or url,
+            'uploader': info.get('uploader') or info.get('channel') or '',
+            'duration': info.get('duration'),
+            'thumbnail': info.get('thumbnail') or '',
+            'view_count': info.get('view_count'),
+            'filesize': info.get('filesize') or info.get('filesize_approx'),
+            'entries': [],
+        }
+        if info.get('_type') == 'playlist':
+            for index, entry in enumerate(info.get('entries') or [], start=1):
+                if entry:
+                    summary['entries'].append({'index': index, 'title': entry.get('title') or entry.get('url', ''),
+                                               'duration': entry.get('duration')})
+        else:
+            # Size of the best video+audio, as a rough estimate.
+            sizes = [f.get('filesize') or f.get('filesize_approx') or 0 for f in info.get('formats') or []
+                     if f.get('vcodec') != 'none' or f.get('acodec') != 'none']
+            if sizes and not summary['filesize']:
+                summary['filesize'] = max(sizes)
+        return summary
 
     # ==============================
     # Progress and Error Handling
     # ==============================
 
-    def progress_hook(self, d: dict) -> None:
-        """
-        A hook function for yt-dlp to report progress.
-        
-        :param d: A dictionary containing progress information.
-        """
-        if self.state.cancelled:
-            # yt-dlp has no cancel API; raising here aborts the download.
-            raise DownloadCancelled()
-        if d.get('status') == 'downloading':
-            try:
-                # Calculate percentage
-                total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
-                downloaded_bytes = d.get('downloaded_bytes', 0)
-                
-                if total_bytes:
-                    percent = (downloaded_bytes / total_bytes) * 100
-                else:
-                    percent = 0.0
+    def progress_hook(self, item: Dict[str, Any], d: dict) -> None:
+        """yt-dlp progress hook for one item; also where pause/cancel take effect."""
+        # yt-dlp has no cancel API; raising here aborts the download.
+        self._check_stop(item)
+        for key in ('tmpfilename', 'filename'):
+            if d.get(key) and '_files' in item:
+                item['_files'].add(d[key])
+        if d.get('status') != 'downloading':
+            return
+        try:
+            total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            downloaded_bytes = d.get('downloaded_bytes') or 0
+            percent = (downloaded_bytes / total_bytes) * 100 if total_bytes else 0.0
 
-                # yt-dlp calls this for every chunk; limit UI updates.
-                now = time.monotonic()
-                if percent < 100 and now - self._last_progress < PROGRESS_INTERVAL:
-                    return
-                self._last_progress = now
-                    
-                # Format speed
-                speed = ANSI_REGEX.sub('', d.get('_speed_str', 'N/A')).strip()
-                
-                # Format ETA
-                eta = ANSI_REGEX.sub('', d.get('_eta_str', 'N/A')).strip()
-                
-                # Format file size
-                downloaded_mb = downloaded_bytes / (1024 * 1024)
-                total_mb = total_bytes / (1024 * 1024)
-                size_str = f"{downloaded_mb:.1f}MB / {total_mb:.1f}MB"
+            # yt-dlp calls this for every chunk; limit UI updates per item.
+            now = time.monotonic()
+            if percent < 100 and now - self._last_progress.get(item['id'], 0) < PROGRESS_INTERVAL:
+                return
+            self._last_progress[item['id']] = now
 
-                if self.on_progress:
-                    self.on_progress(percent, speed, eta, size_str)
-                
-            except Exception as e:
-                logging.error(f"Error in progress hook: {str(e)}")
+            speed = ANSI_REGEX.sub('', d.get('_speed_str') or 'N/A').strip()
+            eta = ANSI_REGEX.sub('', d.get('_eta_str') or 'N/A').strip()
+            size_str = f"{downloaded_bytes / 1048576:.1f}MB / {total_bytes / 1048576:.1f}MB"
+            if self.on_progress:
+                self.on_progress(item['id'], percent, speed, eta, size_str, float(d.get('speed') or 0))
+        except Exception as e:
+            logging.error(f"Error in progress hook: {str(e)}")
 
     def parse_error(self, error: Exception) -> str:
-        """
-        Parses the error message to return a user-friendly string.
-
-        :param error: The exception encountered.
-        :return: A string describing the error.
-        """
+        """Short, user-friendly description of a download error."""
         error_str = str(error).lower()
+        if 'sign in to confirm your age' in error_str or 'age restricted' in error_str or 'age-restricted' in error_str:
+            return "Age-restricted — set 'Cookies from browser' in Settings"
+        if 'members-only' in error_str or 'join this channel' in error_str:
+            return "Members-only — set 'Cookies from browser' in Settings"
+        if 'private video' in error_str:
+            return "Private video"
         if 'unavailable' in error_str:
             return "Content unavailable"
-        if 'age restricted' in error_str:
-            return "Age-restricted content"
         if 'requested format' in error_str:
             return "Format not available"
-        return f"Unknown error: {str(error)}"
+        if 'ffmpeg' in error_str:
+            return "FFmpeg problem — check the FFmpeg path in Settings"
+        if 'http error 403' in error_str or 'unable to extract' in error_str:
+            return "YouTube changed something — try updating yt-dlp in Settings"
+        return str(error).replace('ERROR: ', '')[:200]
+
+    # ==============================
+    # yt-dlp version / update
+    # ==============================
+
+    @staticmethod
+    def get_yt_dlp_version() -> str:
+        """Installed yt-dlp version, read without importing yt-dlp."""
+        if YoutubeDL is not None and 'yt_dlp' in sys.modules:
+            try:
+                return sys.modules['yt_dlp'].version.__version__
+            except AttributeError:
+                pass
+        try:
+            from importlib.metadata import version
+            return version('yt-dlp')
+        except Exception:
+            return 'unknown'
+
+    @staticmethod
+    def update_yt_dlp() -> Tuple[bool, str]:
+        """Upgrade yt-dlp with pip. Takes effect after restarting the app."""
+        if is_frozen():
+            return False, ("This build bundles yt-dlp. Download the latest release of the app "
+                           "to get a newer yt-dlp.")
+        try:
+            result = subprocess.run(
+                [sys.executable, '-m', 'pip', 'install', '--upgrade', 'yt-dlp'],
+                capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"Update failed: {e}"
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout).strip().splitlines()[-3:]
+            return False, "Update failed:\n" + "\n".join(tail)
+        if 'Requirement already satisfied: yt-dlp' in result.stdout and 'Successfully installed' not in result.stdout:
+            return True, "yt-dlp is already up to date."
+        return True, "yt-dlp was updated. Restart the app to use the new version."
 
     # ==============================
     # Validation Methods
     # ==============================
 
     def validate_paths(self, download_path: str, ffmpeg_path: str) -> bool:
-        """
-        Validates the download and FFmpeg paths.
-
-        :param download_path: The directory where downloads will be saved.
-        :param ffmpeg_path: The path to the FFmpeg executable.
-        :return: True if both paths are valid, False otherwise.
-        """
+        """True if the download folder exists (or can be created) and FFmpeg works."""
         try:
-            valid_dl: bool = os.path.exists(download_path) or os.makedirs(download_path, exist_ok=True) is None
-        except Exception as e:
+            os.makedirs(download_path, exist_ok=True)
+            valid_dl = True
+        except OSError as e:
             logging.error(f"Download path validation error: {str(e)}")
             valid_dl = False
-
-        valid_ffmpeg: bool = self.validate_ffmpeg(ffmpeg_path)
-        return valid_dl and valid_ffmpeg
+        return valid_dl and self.validate_ffmpeg(ffmpeg_path)
 
     @staticmethod
     def _ffmpeg_exists(path: str) -> bool:
         return bool(path) and (os.path.isfile(path) or shutil.which(path) is not None)
 
     def find_ffmpeg(self, verify: bool = True) -> str:
-        """Return the first FFmpeg found on PATH or in common folders."""
-        candidates = [shutil.which('ffmpeg')]
-        candidates += [p for p in Config.FFMPEG_CANDIDATES if os.path.isfile(p)]
+        """Return the first FFmpeg found next to the app, on PATH or in common folders."""
+        candidates = [p for p in Config.FFMPEG_CANDIDATES[:2] if os.path.isfile(p)]
+        candidates.append(shutil.which('ffmpeg'))
+        candidates += [p for p in Config.FFMPEG_CANDIDATES[2:] if os.path.isfile(p)]
         for candidate in candidates:
             if candidate and (not verify or self.validate_ffmpeg(candidate)):
                 return candidate
         return ''
 
     def validate_ffmpeg(self, path: str) -> bool:
-        """
-        Validates that FFmpeg is accessible and working.
-
-        :param path: The path to the FFmpeg executable.
-        :return: True if FFmpeg returns its version info, False otherwise.
-        """
+        """True if `path -version` runs and identifies itself as FFmpeg."""
         if not path:
             return False
         try:
-            result = subprocess.run([path, '-version'],
-                                    capture_output=True,
-                                    text=True,
-                                    check=True,
-                                    timeout=10)
+            kwargs = {}
+            if sys.platform == 'win32':
+                kwargs['creationflags'] = 0x08000000  # CREATE_NO_WINDOW: no console flash
+            result = subprocess.run([path, '-version'], capture_output=True, text=True,
+                                    check=True, timeout=10, **kwargs)
             return 'ffmpeg version' in result.stdout.lower()
         except (subprocess.SubprocessError, OSError) as e:
             logging.error(f"FFmpeg validation error: {str(e)}")
             return False
 
     def validate_url(self, url: str) -> bool:
-        """
-        Validates that the URL matches common YouTube URL patterns.
-
-        :param url: The URL to validate.
-        :return: True if the URL is valid, False otherwise.
-        """
-        is_valid = bool(YOUTUBE_URL_REGEX.match(url.strip()))
-        logging.debug(f"URL validation for '{url}': {is_valid}")
-        return is_valid
+        """True if the URL looks like a supported YouTube link."""
+        return bool(YOUTUBE_URL_REGEX.match(url.strip()))
 
     @staticmethod
     def is_playlist_url(url: str) -> bool:
@@ -694,14 +901,9 @@ class DownloadManager:
             return list(self.history.history)
 
     def cleanup(self) -> None:
-        """
-        Performs cleanup actions before exiting the application.
-        """
-        if self.state.downloading:
-            self.cancel_download()
+        """Stop downloads (keeping partial files so they resume next time) and save."""
         with self.queue_lock:
-            # Keep the interrupted item so it is resumed on next launch.
-            if self.state.current_item is not None:
-                self.download_queue.appendleft(self.state.current_item)
-            self._save_queue_state()
+            for item_id in self.active:
+                self._stop_requests[item_id] = 'pause'
+        self._save_queue_state()
         self.save_config()
