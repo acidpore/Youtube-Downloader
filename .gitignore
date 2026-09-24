@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+yt_downloader.log
+yt_downloader_config.json
+queue_state.json
+download_history.json
