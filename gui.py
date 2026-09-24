@@ -4,8 +4,6 @@ from typing import Optional, Callable, Any, Dict, List, Tuple
 import logging
 import webbrowser
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
 LOGGER = logging.getLogger(__name__)
 
 # --- Base YouTubeDownloaderUI Class ---
@@ -341,6 +339,61 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
         self._setup_validation()
         self._add_tooltips()
         self._configure_responsive_layout()
+        self._load_existing_queue()
+
+    def _load_existing_queue(self) -> None:
+        """Show items restored from the previous session in the queue view."""
+        for item in self.queue_handler('list') or []:
+            self._insert_queue_row(item)
+
+    def _insert_queue_row(self, item: Dict[str, Any]) -> None:
+        self.queue_tree.insert('', tk.END, iid=item['id'],
+                               values=(item['url'], item['media_type'], "Queued"))
+
+    def remove_selected(self) -> None:
+        """Remove the selected pending items from the queue."""
+        for iid in self.queue_tree.selection():
+            if self.queue_tree.set(iid, 'status') == "Downloading":
+                continue
+            self.queue_tree.delete(iid)
+            self.queue_handler('remove', iid)
+
+    def clear_queue(self) -> None:
+        """Clear pending items (the one currently downloading is kept)."""
+        for iid in self.queue_tree.get_children():
+            if self.queue_tree.set(iid, 'status') != "Downloading":
+                self.queue_tree.delete(iid)
+        self.queue_handler('clear', None)
+
+    def start_download(self) -> None:
+        """Begin the download process."""
+        if not self.queue_handler('list'):
+            self.status_label.config(text="Queue is empty", foreground="orange")
+            return
+        self.status_label.config(text="Starting queue...", foreground="black")
+        self.progress_bar['value'] = 0
+        self.download_handler('start')
+
+    def update_download_state(self, downloading: bool, cancelled: bool) -> None:
+        """Sync the UI with the core download state."""
+        self.downloading = downloading
+        self.cancel_requested = cancelled
+        if downloading and cancelled:
+            self.download_btn.config(text="Cancelling...", style='red.TButton')
+        elif downloading:
+            self.download_btn.config(text="Cancel Queue", style='red.TButton')
+        else:
+            self.download_btn.config(text="Start Queue", style='green.TButton')
+
+    def download_complete(self, success: bool) -> None:
+        """Handle completion of the whole queue."""
+        if success:
+            self.status_label.config(text="Download complete!", foreground="green")
+        elif self.cancel_requested:
+            self.status_label.config(text="Download cancelled", foreground="orange")
+        else:
+            self.status_label.config(text="Some downloads failed", foreground="red")
+        self.reset_ui()
 
     def setup_styles(self) -> None:
         """Enhanced styling with modern theme and custom configurations."""
@@ -714,31 +767,25 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
                     'ffmpeg_path': self.ffmpeg_entry.get()
                 }
                 if self.queue_handler('add', item):
-                    # Optionally update a Treeview or other display with the new item.
-                    self.queue_tree.insert('', tk.END, values=(url, self.media_type.get(), "Queued"))
+                    self._insert_queue_row(item)
             self.url_text.delete("1.0", tk.END)
         except Exception as e:
             LOGGER.exception("Error processing URL input")
 
-    def update_queue_item_status(self, url: str, status: str) -> None:
+    def update_queue_item_status(self, item_id: str, status: str) -> None:
         """Update the status of a queue item."""
-        for item in self.queue_tree.get_children():
-            if self.queue_tree.item(item)['values'][0] == url:
-                self.queue_tree.set(item, 'status', status)
-                # Apply status-specific styling
-                if status == "Complete":
-                    self.queue_tree.item(item, tags=('complete',))
-                elif status == "Failed":
-                    self.queue_tree.item(item, tags=('error',))
-                elif status == "Downloading":
-                    self.queue_tree.item(item, tags=('processing',))
-                break
+        if not self.queue_tree.exists(item_id):
+            return
+        self.queue_tree.set(item_id, 'status', status)
+        tags = {"Complete": ('complete',), "Failed": ('error',),
+                "Cancelled": ('error',), "Downloading": ('processing',)}
+        self.queue_tree.item(item_id, tags=tags.get(status, ()))
 
     def clear_completed(self) -> None:
         """Remove all completed items from the queue."""
         items_to_remove = []
         for item in self.queue_tree.get_children():
-            if self.queue_tree.item(item)['values'][2] == "Complete":
+            if self.queue_tree.set(item, 'status') == "Complete":
                 items_to_remove.append(item)
         
         for item in items_to_remove:

@@ -37,6 +37,8 @@ def main():
             dm.remove_from_queue(data)
         elif action == 'clear':
             dm.clear_queue()
+        elif action == 'list':
+            return dm.get_queue()
         elif action == 'validate_url':
             return dm.validate_url(data)
 
@@ -74,6 +76,7 @@ def main():
     dm.on_progress = safe_update_progress
     dm.on_status = safe_update_status
     dm.on_complete = safe_download_complete
+    dm.on_item_status = lambda item_id, status: root.after(0, app.update_queue_item_status, item_id, status)
 
     # Add state observer
     def on_state_change(downloading: bool, cancelled: bool):

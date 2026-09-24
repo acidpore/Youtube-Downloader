@@ -6,6 +6,7 @@ import threading
 import time
 import subprocess
 import glob
+import uuid
 from collections import deque, OrderedDict
 from typing import Optional, Callable, Any, Dict, List
 from yt_dlp import YoutubeDL, DownloadError
@@ -15,6 +16,10 @@ from datetime import datetime
 ANSI_REGEX = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
 
 LOGGER = logging.getLogger(__name__)
+
+
+class DownloadCancelled(Exception):
+    """Raised from the progress hook to abort the running yt-dlp download."""
 
 class Config:
     """Application configuration constants."""
@@ -138,6 +143,7 @@ class DownloadManager:
         self.on_progress: Optional[Callable[[float, str, str, str], None]] = None
         self.on_status: Optional[Callable[[str, str], None]] = None
         self.on_complete: Optional[Callable[[bool], None]] = None
+        self.on_item_status: Optional[Callable[[str, str], None]] = None
 
         self.setup_logging()
         self._load_queue_state()
@@ -146,12 +152,18 @@ class DownloadManager:
         """
         Sets up logging to a file with INFO level.
         """
-        logging.basicConfig(
-            filename='yt_downloader.log',
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            filemode='a'
+        root_logger = logging.getLogger()
+        log_path = os.path.abspath('yt_downloader.log')
+        already_attached = any(
+            isinstance(h, logging.FileHandler) and h.baseFilename == log_path
+            for h in root_logger.handlers
         )
+        if not already_attached:
+            handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            root_logger.addHandler(handler)
+        if root_logger.level == logging.NOTSET or root_logger.level > logging.INFO:
+            root_logger.setLevel(logging.INFO)
         logging.info("DownloadManager initialized.")
 
     # ==============================
@@ -251,6 +263,7 @@ class DownloadManager:
                     queue_items = json.load(f)
                 for item in queue_items:
                     if item.get('status') != 'Complete':
+                        item.setdefault('id', uuid.uuid4().hex)
                         self.download_queue.append(item)
         except Exception as e:
             LOGGER.error(f"Error loading queue state: {e}")
@@ -267,16 +280,24 @@ class DownloadManager:
     def add_to_queue(self, item: Dict[str, Any]) -> bool:
         """Add an item to the download queue."""
         with self.queue_lock:
+            item.setdefault('id', uuid.uuid4().hex)
             self.download_queue.append(item)
             self._save_queue_state()
             return True
 
-    def remove_from_queue(self, index: int) -> None:
-        """Remove an item from the download queue."""
+    def get_queue(self) -> List[Dict[str, Any]]:
+        """Return a snapshot of the pending queue items."""
         with self.queue_lock:
-            if 0 <= index < len(self.download_queue):
-                self.download_queue.remove(index)
-                self._save_queue_state()
+            return list(self.download_queue)
+
+    def remove_from_queue(self, item_id: str) -> None:
+        """Remove the pending item with the given id from the download queue."""
+        with self.queue_lock:
+            for item in self.download_queue:
+                if item.get('id') == item_id:
+                    self.download_queue.remove(item)
+                    self._save_queue_state()
+                    break
 
     def clear_queue(self) -> None:
         """Clear the entire download queue."""
@@ -302,67 +323,84 @@ class DownloadManager:
 
     def cancel_download(self) -> None:
         """
-        Signals the current download process to cancel with proper cleanup.
+        Signals the current download to stop. The running download is aborted
+        from within progress_hook, which raises DownloadCancelled.
         """
-        self.state.update_state(False, True)
-        if self.current_download:
+        self.state.update_state(self.state.downloading, True)
+        logging.info("Cancellation requested.")
+        if self.on_status:
+            self.on_status("Cancelling download...", "orange")
+
+    def _remove_partial_files(self, item: Dict[str, Any]) -> None:
+        """Delete yt-dlp partial download files left in the item's folder."""
+        for partial_file in glob.glob(os.path.join(glob.escape(item['path']), '*.part')):
             try:
-                self.current_download.cancel_download()
-                
-                # Clean up partial downloads
-                if self.state.current_item:
-                    partial_path = os.path.join(
-                        self.state.current_item['path'],
-                        '*.part'  # yt-dlp partial download files
-                    )
-                    for partial_file in glob.glob(partial_path):
-                        try:
-                            os.remove(partial_file)
-                        except OSError:
-                            pass
-                            
-                logging.info("Current download cancelled and cleaned up.")
-                
-                if self.on_status:
-                    self.on_status("Download cancelled", "orange")
-                    
-            except Exception as e:
-                logging.error(f"Error cancelling current download: {str(e)}")
+                os.remove(partial_file)
+            except OSError:
+                pass
+
+    def _set_item_status(self, item: Dict[str, Any], status: str) -> None:
+        if self.on_item_status:
+            self.on_item_status(item.get('id'), status)
 
     def process_queue(self) -> None:
         """
         Processes items in the download queue until cancelled or the queue is empty.
         Calls the on_complete callback once processing finishes.
         """
+        failed = 0
         while not self.state.cancelled:
             with self.queue_lock:
                 if not self.download_queue:
                     logging.info("Download queue exhausted.")
                     break
-                self.state.current_item = self.download_queue.popleft()
+                item = self.download_queue.popleft()
+                self.state.current_item = item
+                self._save_queue_state()
 
+            self._set_item_status(item, "Downloading")
             try:
-                self.run_download(self.state.current_item)
+                ok = self.run_download(item)
+            except DownloadCancelled:
+                ok = None
             except Exception as e:
-                logging.error(f"Download error for {self.state.current_item.get('url')}: {str(e)}")
-                self.handle_error(e, self.state.current_item)
+                logging.error(f"Download error for {item.get('url')}: {str(e)}")
+                if self.on_status:
+                    self.on_status(f"Download failed: {self.parse_error(e)}", "red")
+                ok = False
+
+            if ok is None:
+                self._remove_partial_files(item)
+                self._set_item_status(item, "Cancelled")
+                logging.info(f"Download cancelled: {item.get('url')}")
+            elif ok:
+                self._set_item_status(item, "Complete")
+            else:
+                failed += 1
+                self._set_item_status(item, "Failed")
 
             self.state.current_item = None
+            self.current_download = None
 
-        self.state.update_state(False)
+        cancelled = self.state.cancelled
+        self.state.update_state(False, cancelled)
+        if self.on_status and cancelled:
+            self.on_status("Download cancelled", "orange")
         if self.on_complete:
-            # The on_complete callback receives a bool indicating whether cancellation occurred.
-            self.on_complete(not self.state.cancelled)
+            # Success only when nothing failed and the user did not cancel.
+            self.on_complete(failed == 0 and not cancelled)
         logging.info("Download processing completed.")
 
-    def run_download(self, item: Dict[str, Any]) -> None:
+    def run_download(self, item: Dict[str, Any]) -> bool:
         """
-        Attempts to download a single item with improved error handling and retry logic.
+        Downloads a single item, retrying up to MAX_RETRIES times.
+
+        :return: True on success, False on permanent failure.
+        :raises DownloadCancelled: if the user cancelled the download.
         """
         for attempt in range(1, self.MAX_RETRIES + 1):
             if self.state.cancelled:
-                logging.info("Download cancelled before starting.")
-                return
+                raise DownloadCancelled()
 
             try:
                 ydl_opts = self.build_ydl_opts(item)
@@ -376,7 +414,7 @@ class DownloadManager:
                         if 'Video unavailable' in str(e):
                             if self.on_status:
                                 self.on_status(f"Video unavailable: {item['url']}", "red")
-                            return
+                            return False
                         raise
 
                     if self.on_status:
@@ -389,9 +427,11 @@ class DownloadManager:
                         self.on_status(f"Successfully downloaded: {info.get('title', item['url'])}", "green")
                         
                     logging.info(f"Download completed: {item.get('url')}")
-                    return
+                    return True
 
-            except (DownloadError, Exception) as e:
+            except Exception as e:
+                if self.state.cancelled or isinstance(e, DownloadCancelled):
+                    raise DownloadCancelled()
                 error_msg = str(e)
                 
                 # Check for specific error conditions
@@ -399,19 +439,28 @@ class DownloadManager:
                     delay = min(60 * attempt, 300)  # Max 5 minute delay
                     if self.on_status:
                         self.on_status(f"Rate limited. Waiting {delay} seconds...", "orange")
-                    time.sleep(delay)
+                    self._interruptible_sleep(delay)
                     continue
                     
                 if attempt < self.MAX_RETRIES:
                     delay = self.RETRY_DELAY * attempt
                     if self.on_status:
                         self.on_status(f"Download failed. Retrying in {delay} seconds... ({attempt}/{self.MAX_RETRIES})", "orange")
-                    time.sleep(delay)
+                    self._interruptible_sleep(delay)
                 else:
                     logging.error(f"All attempts failed for {item.get('url')}")
                     if self.on_status:
                         self.on_status(f"Download failed after {self.MAX_RETRIES} attempts: {self.parse_error(e)}", "red")
-                    raise e
+                    return False
+        return False
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """Sleep for the given time, waking early (and raising) on cancel."""
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.state.cancelled:
+                raise DownloadCancelled()
+            time.sleep(0.2)
 
     def build_ydl_opts(self, item: Dict[str, Any]) -> dict:
         """
@@ -458,6 +507,9 @@ class DownloadManager:
         
         :param d: A dictionary containing progress information.
         """
+        if self.state.cancelled:
+            # yt-dlp has no cancel API; raising here aborts the download.
+            raise DownloadCancelled()
         if d.get('status') == 'downloading':
             try:
                 # Calculate percentage
@@ -485,28 +537,6 @@ class DownloadManager:
                 
             except Exception as e:
                 logging.error(f"Error in progress hook: {str(e)}")
-
-    def handle_error(self, error: Exception, item: Dict[str, Any]) -> None:
-        """
-        Handles errors during download by either retrying the item or reporting a permanent failure.
-
-        :param error: The exception encountered.
-        :param item: The download item that failed.
-        """
-        error_msg: str = self.parse_error(error)
-        logging.error(f"Download failed for {item.get('url')}: {error_msg}")
-
-        # Increment retry count and requeue if below maximum retries.
-        retries: int = item.get('retries', 0)
-        if retries < self.MAX_RETRIES:
-            item['retries'] = retries + 1
-            with self.queue_lock:
-                self.download_queue.appendleft(item)
-            remaining = self.MAX_RETRIES - item['retries']
-            logging.info(f"Requeued {item.get('url')} with {remaining} retries remaining.")
-        else:
-            if self.on_status:
-                self.on_status(f"Permanent failure: {error_msg}", "red")
 
     def parse_error(self, error: Exception) -> str:
         """
@@ -582,10 +612,11 @@ class DownloadManager:
         """
         Performs cleanup actions before exiting the application.
         """
-        self._save_queue_state()
+        if self.state.downloading:
+            self.cancel_download()
+        with self.queue_lock:
+            # Keep the interrupted item so it is resumed on next launch.
+            if self.state.current_item is not None:
+                self.download_queue.appendleft(self.state.current_item)
+            self._save_queue_state()
         self.save_config()
-        if self.current_download:
-            try:
-                self.current_download.cancel_download()
-            except Exception as e:
-                logging.error(f"Cleanup error: {str(e)}")
