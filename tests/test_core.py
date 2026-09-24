@@ -195,5 +195,16 @@ class FfmpegTest(unittest.TestCase):
         self.assertFalse(dm.validate_ffmpeg('/nonexistent/ffmpeg'))
 
 
+
+class FirstRunConfigTest(unittest.TestCase):
+    def test_defaults_without_config_file(self):
+        with mock.patch.object(core.DownloadManager, 'CONFIG_FILE',
+                               os.path.join(_TMP_HOME, 'does-not-exist.json')):
+            dm = core.DownloadManager()
+        self.assertEqual(dm.config['download_path'], core.Config.DEFAULT_DOWNLOAD_PATH)
+        self.assertEqual(dm.config['media_type'], 'Video')
+        self.assertEqual(dm.config['theme'], 'light')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,13 +1,23 @@
+import sys
 import tkinter as tk
-from gui import YouTubeDownloaderUI, EnhancedYouTubeDownloaderUI
+from gui import YouTubeDownloaderUI
 from core import DownloadManager
 
+
+def _enable_windows_dpi_awareness() -> None:
+    """Render crisp text on high-DPI Windows displays instead of a blurry bitmap."""
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+
 def main():
-    # Initialize the main Tkinter window
+    _enable_windows_dpi_awareness()
     root = tk.Tk()
-    root.title("YouTube Downloader")
-    root.geometry("800x600")
-    root.resizable(True, True)  # Allow window resizing
 
     # Initialize the DownloadManager (core component)
     dm = DownloadManager()
@@ -68,7 +78,7 @@ def main():
     
     def safe_update_status(msg: str, color: str):
         # Schedule the status update on the main thread
-        root.after(0, app.status_label.config, {'text': msg, 'foreground': color})
+        root.after(0, app.set_status, msg, color)
 
     def safe_download_complete(success: bool):
         # Schedule the download complete update on the main thread
@@ -89,13 +99,16 @@ def main():
     # -------------------------
     # Initialize the Enhanced GUI and pass the dependencies
     # -------------------------
-    app = EnhancedYouTubeDownloaderUI(
+    app = YouTubeDownloaderUI(
         root,
         config_handler=config_handler,
         queue_handler=queue_handler,
         download_handler=download_handler,
         path_validator=path_validator
     )
+
+    # Load yt-dlp in the background once the window is visible.
+    root.after(500, dm.preload)
 
     # Start the main event loop
     root.mainloop()

@@ -11,13 +11,31 @@ import sys
 import uuid
 from collections import deque, OrderedDict
 from typing import Optional, Callable, Any, Dict, List
-from yt_dlp import YoutubeDL, DownloadError
 from datetime import datetime
 
 # Regular expression to strip ANSI escape codes from progress strings.
 ANSI_REGEX = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
 
 LOGGER = logging.getLogger(__name__)
+
+# yt-dlp takes most of the startup time and memory, so it is imported lazily
+# (see _ensure_yt_dlp) instead of at module import.
+YoutubeDL = None
+DownloadError = None
+
+# Minimum seconds between progress callbacks sent to the UI.
+PROGRESS_INTERVAL = 0.1
+
+
+def _ensure_yt_dlp() -> None:
+    """Import yt-dlp on first use."""
+    global YoutubeDL, DownloadError
+    if YoutubeDL is None or DownloadError is None:
+        import yt_dlp
+        if YoutubeDL is None:
+            YoutubeDL = yt_dlp.YoutubeDL
+        if DownloadError is None:
+            DownloadError = yt_dlp.utils.DownloadError
 
 # Supported YouTube URLs: watch, shorts, live, embed, playlist, youtu.be,
 # on www/m/music subdomains.
@@ -149,7 +167,8 @@ class DownloadManager:
         self.state = DownloadState()
         self.history = DownloadHistory()
         self.queue_lock = threading.Lock()
-        self.current_download: Optional[YoutubeDL] = None
+        self.current_download: Optional[Any] = None
+        self._last_progress = 0.0
 
         # Callback functions for UI feedback
         self.on_progress: Optional[Callable[[float, str, str, str], None]] = None
@@ -200,16 +219,17 @@ class DownloadManager:
 
         :return: An OrderedDict containing configuration parameters.
         """
+        config: dict = {}
         try:
             if os.path.exists(self.CONFIG_FILE):
-                with open(self.CONFIG_FILE, 'r') as f:
-                    config = json.load(f, object_pairs_hook=OrderedDict)
-                    validated_config = self.validate_config(config)
-                    logging.info("Configuration loaded and validated.")
-                    return validated_config
-        except (json.JSONDecodeError, Exception) as e:
+                with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f, object_pairs_hook=OrderedDict)
+                if isinstance(loaded, dict):
+                    config = loaded
+        except (OSError, ValueError) as e:
             logging.error(f"Config load error: {str(e)}")
-        return OrderedDict()
+        # Always validate so a first run (no config file) still gets defaults.
+        return self.validate_config(config)
 
     def validate_config(self, config: dict) -> OrderedDict:
         """
@@ -230,12 +250,15 @@ class DownloadManager:
         
         # Try to find FFmpeg in common locations
         ffmpeg_path = config.get('ffmpeg_path', '')
-        if not self.validate_ffmpeg(ffmpeg_path):
-            ffmpeg_path = self.find_ffmpeg() or ffmpeg_path
+        # Cheap existence check only; the full `ffmpeg -version` check runs
+        # when a download is started (validate_paths).
+        if not self._ffmpeg_exists(ffmpeg_path):
+            ffmpeg_path = self.find_ffmpeg(verify=False) or ffmpeg_path
                 
         validated['ffmpeg_path'] = ffmpeg_path
         
         # Validate media options
+        validated['theme'] = self._validate_value(config.get('theme'), ('light', 'dark'), 'light')
         validated['media_type'] = self._validate_value(config.get('media_type'), self.MEDIA_TYPES, 'Video')
         validated['video_resolution'] = self._validate_value(config.get('video_resolution'), self.VIDEO_QUALITIES, 'Best')
         validated['audio_quality'] = self._validate_value(config.get('audio_quality'), self.AUDIO_QUALITIES, '128k')
@@ -322,6 +345,10 @@ class DownloadManager:
     # ==============================
     # Download Control
     # ==============================
+
+    def preload(self) -> None:
+        """Import yt-dlp in the background so the first download starts quickly."""
+        threading.Thread(target=_ensure_yt_dlp, daemon=True).start()
 
     def start_download(self) -> None:
         """
@@ -421,6 +448,7 @@ class DownloadManager:
                 raise DownloadCancelled()
 
             try:
+                _ensure_yt_dlp()
                 ydl_opts = self.build_ydl_opts(item)
                 with YoutubeDL(ydl_opts) as ydl:
                     self.current_download = ydl
@@ -551,6 +579,12 @@ class DownloadManager:
                     percent = (downloaded_bytes / total_bytes) * 100
                 else:
                     percent = 0.0
+
+                # yt-dlp calls this for every chunk; limit UI updates.
+                now = time.monotonic()
+                if percent < 100 and now - self._last_progress < PROGRESS_INTERVAL:
+                    return
+                self._last_progress = now
                     
                 # Format speed
                 speed = ANSI_REGEX.sub('', d.get('_speed_str', 'N/A')).strip()
@@ -606,12 +640,16 @@ class DownloadManager:
         valid_ffmpeg: bool = self.validate_ffmpeg(ffmpeg_path)
         return valid_dl and valid_ffmpeg
 
-    def find_ffmpeg(self) -> str:
-        """Return the first working FFmpeg found on PATH or in common folders."""
+    @staticmethod
+    def _ffmpeg_exists(path: str) -> bool:
+        return bool(path) and (os.path.isfile(path) or shutil.which(path) is not None)
+
+    def find_ffmpeg(self, verify: bool = True) -> str:
+        """Return the first FFmpeg found on PATH or in common folders."""
         candidates = [shutil.which('ffmpeg')]
         candidates += [p for p in Config.FFMPEG_CANDIDATES if os.path.isfile(p)]
         for candidate in candidates:
-            if candidate and self.validate_ffmpeg(candidate):
+            if candidate and (not verify or self.validate_ffmpeg(candidate)):
                 return candidate
         return ''
 

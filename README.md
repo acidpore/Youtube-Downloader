@@ -12,6 +12,18 @@ Aplikasi desktop berbasis GUI untuk mengunduh video/audio dari YouTube. Dibangun
 - **Cancel** yang benar-benar menghentikan download dan menghapus file `.part`
 - **Antrean dilanjutkan** otomatis setelah aplikasi ditutup/dibuka lagi
 - **Riwayat download** dan tombol **Open Folder**
+- **Tampilan modern** dengan mode terang/gelap (☾/☀), tombol Paste, validasi link langsung, dan pengaturan FFmpeg di menu ⚙
+- **Ringan**: yt-dlp baru dimuat setelah jendela tampil, jadi aplikasi terbuka cepat
+
+### Shortcut
+
+| Tombol | Fungsi |
+|---|---|
+| `Ctrl+Enter` (di kotak link) | Tambah ke antrean |
+| `Delete` (di tabel antrean) | Hapus item terpilih |
+| Klik ganda item | Buka di browser |
+| Klik kanan item | Menu (buka, salin link, hapus) |
+| `Ctrl+Q` | Keluar |
 - Nama file memakai ID video (`Judul [id].mp4`) sehingga judul yang sama tidak saling menimpa
 
 URL yang didukung: `youtube.com/watch`, `youtu.be`, `youtube.com/shorts`, `youtube.com/live`, `youtube.com/embed`, `youtube.com/playlist`, termasuk subdomain `m.` dan `music.`.
@@ -44,7 +56,7 @@ Config, antrean, riwayat, dan log disimpan di:
 
 ## Testing
 
-Unit test untuk logika inti (tanpa jaringan, yt-dlp disimulasikan):
+Unit test untuk logika inti dan GUI (tanpa jaringan, yt-dlp disimulasikan; test GUI otomatis dilewati bila tidak ada layar):
 
 ```bash
 python -m unittest discover -s tests
