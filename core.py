@@ -19,6 +19,17 @@ ANSI_REGEX = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
 
 LOGGER = logging.getLogger(__name__)
 
+# Supported YouTube URLs: watch, shorts, live, embed, playlist, youtu.be,
+# on www/m/music subdomains.
+YOUTUBE_URL_REGEX = re.compile(
+    r'^(https?://)?'
+    r'(?:(?:www|m|music)\.)?'
+    r'(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/|playlist\?(?:.*&)?list=)'
+    r'|youtu\.be/)'
+    r'[\w-]+',
+    re.IGNORECASE
+)
+
 
 class DownloadCancelled(Exception):
     """Raised from the progress hook to abort the running yt-dlp download."""
@@ -145,6 +156,7 @@ class DownloadManager:
         self.on_status: Optional[Callable[[str, str], None]] = None
         self.on_complete: Optional[Callable[[bool], None]] = None
         self.on_item_status: Optional[Callable[[str, str], None]] = None
+        self.on_item_title: Optional[Callable[[str, str], None]] = None
 
         self.setup_logging()
         self._load_queue_state()
@@ -415,7 +427,8 @@ class DownloadManager:
                     
                     # Extract info first to validate video availability
                     try:
-                        info = ydl.extract_info(item['url'], download=False)
+                        # process=False only resolves metadata (cheap for playlists).
+                        info = ydl.extract_info(item['url'], download=False, process=False)
                     except DownloadError as e:
                         if 'Video unavailable' in str(e):
                             if self.on_status:
@@ -423,7 +436,9 @@ class DownloadManager:
                             return False
                         raise
 
-                    item['title'] = info.get('title', item['url'])
+                    item['title'] = info.get('title') or item['url']
+                    if self.on_item_title:
+                        self.on_item_title(item.get('id'), item['title'])
                     if self.on_status:
                         self.on_status(f"Downloading: {item['title']}", "black")
 
@@ -476,8 +491,15 @@ class DownloadManager:
         :param item: A dictionary with download parameters.
         :return: A dictionary of options for YoutubeDL.
         """
+        if self.is_playlist_url(item['url']):
+            # Keep each playlist in its own folder, in playlist order.
+            name = os.path.join('%(playlist_title)s', '%(playlist_index)03d - %(title)s [%(id)s].%(ext)s')
+        else:
+            name = '%(title)s [%(id)s].%(ext)s'
         opts: dict = {
-            'outtmpl': os.path.join(item['path'], '%(title)s.%(ext)s'),
+            'outtmpl': os.path.join(item['path'], name),
+            'noplaylist': not self.is_playlist_url(item['url']),
+            'ignoreerrors': 'only_download' if self.is_playlist_url(item['url']) else False,
             'quiet': True,
             'no_warnings': True,
             'ffmpeg_location': item['ffmpeg_path'],
@@ -488,12 +510,14 @@ class DownloadManager:
         }
 
         if item['media_type'] == 'Video':
+            # Any codec is allowed so 1440p/4K (VP9/AV1) is not skipped;
+            # the result is merged into an MP4 container.
             if item['quality'] == 'Best':
-                opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+                opts['format'] = 'bestvideo+bestaudio/best'
             else:
-                # Remove the trailing 'p' (if present) to obtain the numeric resolution
-                res = item['quality'][:-1]
-                opts['format'] = f'bestvideo[height<={res}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+                res = item['quality'].rstrip('p')
+                opts['format'] = f'bestvideo[height<={res}]+bestaudio/best[height<={res}]/best'
+            opts['merge_output_format'] = 'mp4'
         else:
             opts['format'] = 'bestaudio/best'
             opts['postprocessors'] = [{
@@ -618,14 +642,18 @@ class DownloadManager:
         :param url: The URL to validate.
         :return: True if the URL is valid, False otherwise.
         """
-        patterns = [
-            r'^(https?://)?(www\.)?youtube\.com/watch\?v=',
-            r'^(https?://)?(www\.)?youtu\.be/',
-            r'^(https?://)?(www\.)?youtube\.com/playlist\?list='
-        ]
-        is_valid = any(re.match(pattern, url) for pattern in patterns)
+        is_valid = bool(YOUTUBE_URL_REGEX.match(url.strip()))
         logging.debug(f"URL validation for '{url}': {is_valid}")
         return is_valid
+
+    @staticmethod
+    def is_playlist_url(url: str) -> bool:
+        """True for playlist pages (not a single video that carries a list= param)."""
+        return bool(re.search(r'youtube\.com/playlist\?', url))
+
+    def get_history(self) -> List[Dict[str, Any]]:
+        with self.history.lock:
+            return list(self.history.history)
 
     def cleanup(self) -> None:
         """

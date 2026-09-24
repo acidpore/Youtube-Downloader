@@ -1,24 +1,43 @@
-Sebuah aplikasi desktop berbasis GUI untuk mengunduh video dari YouTube dengan berbagai pilihan resolusi. Dibangun menggunakan Python dan library Tkinter untuk antarmuka pengguna, serta memanfaatkan yt-dlp sebagai engine pengunduhan.
+# YouTube Downloader
 
-Fitur Utama
-  1. Multi-Resolusi Support
-      - Pilih kualitas video: Best (Terbaik), 1080p, 720p, 480p, atau 360p
-      - Format output otomatis dalam MP4
-  2. Antarmuka Pengguna Intuitif
-      - Input URL YouTube langsung
-      - Browser folder untuk memilih lokasi penyimpanan
-      - Tampilan progress bar real-time
-      - Status update detail (persentase, kecepatan, ETA)
-  3. Fungsi Kontrol
-      - Tombol cancel untuk menghentikan proses
-      - Notifikasi error handling
-      - Auto-reset UI setelah selesai
-  4. Optimasi Performa
-      - Proses unduh di thread terpisah
-      - Kompatibel dengan Windows 10/11
-      - Mendukung ffmpeg untuk proses remuxing
+Aplikasi desktop berbasis GUI untuk mengunduh video/audio dari YouTube. Dibangun dengan Python + Tkinter, memakai [yt-dlp](https://github.com/yt-dlp/yt-dlp) sebagai engine pengunduhan dan FFmpeg untuk menggabungkan/konversi file.
 
-Persyaratan Sistem :
-    1. OS: Windows 7/8/10/11 (64-bit)
-    2. Python 3.6+
-    3. FFmpeg
+## Fitur
+
+- **Video**: Best, 1080p, 720p, 480p, 360p — hasil digabung ke MP4 (termasuk sumber VP9/AV1, jadi kualitas 1440p/4K ikut terambil pada "Best")
+- **Audio**: mp3, aac, wav, m4a dengan bitrate 128k–320k
+- **Antrean (queue)**: tempel banyak URL sekaligus (satu per baris), hapus item, clear, clear completed
+- **Status per item**: judul video, progres `Downloading 42%`, Complete / Failed / Cancelled
+- **Playlist**: disimpan di folder bernama playlist, berurutan (`001 - Judul [id].mp4`)
+- **Cancel** yang benar-benar menghentikan download dan menghapus file `.part`
+- **Antrean dilanjutkan** otomatis setelah aplikasi ditutup/dibuka lagi
+- **Riwayat download** dan tombol **Open Folder**
+- Nama file memakai ID video (`Judul [id].mp4`) sehingga judul yang sama tidak saling menimpa
+
+URL yang didukung: `youtube.com/watch`, `youtu.be`, `youtube.com/shorts`, `youtube.com/live`, `youtube.com/embed`, `youtube.com/playlist`, termasuk subdomain `m.` dan `music.`.
+
+## Persyaratan
+
+- Python 3.9+ (dengan Tkinter; di Linux: `sudo apt install python3-tk`)
+- [FFmpeg](https://ffmpeg.org/download.html) — dicari otomatis di PATH, atau pilih lokasinya lewat aplikasi
+- Windows 10/11, macOS, atau Linux
+
+## Instalasi & Menjalankan
+
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+Perbarui yt-dlp secara berkala bila download mulai gagal (YouTube sering berubah):
+
+```bash
+pip install -U yt-dlp
+```
+
+## Lokasi Data
+
+Config, antrean, riwayat, dan log disimpan di:
+
+- Windows: `%APPDATA%\YouTubeDownloader\`
+- macOS/Linux: `~/.yt-downloader/`

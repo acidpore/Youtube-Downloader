@@ -2,6 +2,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from typing import Optional, Callable, Any, Dict, List, Tuple
 import logging
+import os
+import subprocess
+import sys
 import webbrowser
 
 from core import Config
@@ -143,6 +146,7 @@ class YouTubeDownloaderUI:
 # --- Enhanced UI Subclass ---
 class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
     def __init__(self, *args, **kwargs):
+        self.current_item_id: Optional[str] = None
         super().__init__(*args, **kwargs)
         self._create_context_menu()
         self._setup_validation()
@@ -157,12 +161,12 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
 
     def _insert_queue_row(self, item: Dict[str, Any]) -> None:
         self.queue_tree.insert('', tk.END, iid=item['id'],
-                               values=(item['url'], item['media_type'], "Queued"))
+                               values=(item.get('title', ''), item['url'], item['media_type'], "Queued"))
 
     def remove_selected(self) -> None:
         """Remove the selected pending items from the queue."""
         for iid in self.queue_tree.selection():
-            if self.queue_tree.set(iid, 'status') == "Downloading":
+            if iid == self.current_item_id:
                 continue
             self.queue_tree.delete(iid)
             self.queue_handler('remove', iid)
@@ -170,7 +174,7 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
     def clear_queue(self) -> None:
         """Clear pending items (the one currently downloading is kept)."""
         for iid in self.queue_tree.get_children():
-            if self.queue_tree.set(iid, 'status') != "Downloading":
+            if iid != self.current_item_id:
                 self.queue_tree.delete(iid)
         self.queue_handler('clear', None)
 
@@ -354,17 +358,19 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
         ).pack(side=tk.LEFT, padx=2)
         
         # Create Treeview
-        columns = ('url', 'media_type', 'status')
+        columns = ('title', 'url', 'media_type', 'status')
         self.queue_tree = ttk.Treeview(queue_frame, columns=columns, show='headings', height=5)
         
         # Configure columns
+        self.queue_tree.heading('title', text="Title", anchor=tk.W)
         self.queue_tree.heading('url', text="URL", anchor=tk.W)
         self.queue_tree.heading('media_type', text="Type", anchor=tk.W)
         self.queue_tree.heading('status', text="Status", anchor=tk.W)
         
-        self.queue_tree.column('url', width=400, stretch=True)
+        self.queue_tree.column('title', width=250, stretch=True)
+        self.queue_tree.column('url', width=250, stretch=True)
         self.queue_tree.column('media_type', width=80, stretch=False)
-        self.queue_tree.column('status', width=100, stretch=False)
+        self.queue_tree.column('status', width=120, stretch=False)
         
         # Add scrollbars
         y_scrollbar = ttk.Scrollbar(queue_frame, orient=tk.VERTICAL, command=self.queue_tree.yview)
@@ -456,7 +462,45 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
         control_frame.grid(row=5, column=0, columnspan=4, padx=10, pady=5, sticky=tk.EW)
         self.download_btn = ttk.Button(control_frame, text="Start Queue", command=self.toggle_download, style='green.TButton')
         self.download_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="Open Folder", command=self.open_download_folder).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="History", command=self.show_history).pack(side=tk.LEFT, padx=5)
         ttk.Button(control_frame, text="Exit", command=self.clean_exit, style='red.TButton').pack(side=tk.LEFT, padx=5)
+
+    def open_download_folder(self) -> None:
+        """Open the download folder in the system file manager."""
+        path = self.path_entry.get()
+        if not os.path.isdir(path):
+            messagebox.showerror("Error", f"Folder not found:\n{path}")
+            return
+        try:
+            if sys.platform == 'win32':
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
+        except OSError as e:
+            messagebox.showerror("Error", f"Could not open folder: {e}")
+
+    def show_history(self) -> None:
+        """Show the download history in a separate window."""
+        win = tk.Toplevel(self.root)
+        win.title("Download History")
+        win.geometry("700x350")
+        columns = ('time', 'title', 'format', 'status')
+        tree = ttk.Treeview(win, columns=columns, show='headings')
+        for col, text, width in (('time', "Time", 140), ('title', "Title", 350),
+                                 ('format', "Format", 70), ('status', "Status", 90)):
+            tree.heading(col, text=text, anchor=tk.W)
+            tree.column(col, width=width, stretch=(col == 'title'))
+        scrollbar = ttk.Scrollbar(win, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        for entry in self.queue_handler('history') or []:
+            timestamp = entry.get('timestamp', '')[:19].replace('T', ' ')
+            tree.insert('', tk.END, values=(timestamp, entry.get('title', ''),
+                                            entry.get('format', ''), entry.get('status', '')))
 
     def _create_context_menu(self) -> None:
         """Create right-click context menu for queue items."""
@@ -475,9 +519,7 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
         """Open selected URL in default browser."""
         selected = self.queue_tree.selection()
         if selected:
-            item = self.queue_tree.item(selected[0])
-            url = item['values'][0]
-            webbrowser.open(url)
+            webbrowser.open(self.queue_tree.set(selected[0], 'url'))
 
     def _setup_validation(self) -> None:
         """Set up real-time URL validation for the multi-line Text widget."""
@@ -543,6 +585,10 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
         # Update file size
         self.file_size_label.config(text=size)
         
+        # Per-item progress in the queue view
+        if self.current_item_id and self.queue_tree.exists(self.current_item_id):
+            self.queue_tree.set(self.current_item_id, 'status', f"Downloading {percent:.0f}%")
+
         # Update status
         status_text = f"Downloading... | Speed: {speed} | ETA: {eta}"
         self.status_label.config(text=status_text, foreground="black")
@@ -586,9 +632,14 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
         if not self.queue_tree.exists(item_id):
             return
         self.queue_tree.set(item_id, 'status', status)
+        self.current_item_id = item_id if status == "Downloading" else None
         tags = {"Complete": ('complete',), "Failed": ('error',),
                 "Cancelled": ('error',), "Downloading": ('processing',)}
         self.queue_tree.item(item_id, tags=tags.get(status, ()))
+
+    def update_queue_item_title(self, item_id: str, title: str) -> None:
+        if self.queue_tree.exists(item_id):
+            self.queue_tree.set(item_id, 'title', title)
 
     def clear_completed(self) -> None:
         """Remove all completed items from the queue."""
