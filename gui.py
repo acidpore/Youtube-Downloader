@@ -4,6 +4,8 @@ from typing import Optional, Callable, Any, Dict, List, Tuple
 import logging
 import webbrowser
 
+from core import Config
+
 LOGGER = logging.getLogger(__name__)
 
 # --- Base YouTubeDownloaderUI Class ---
@@ -35,6 +37,10 @@ class YouTubeDownloaderUI:
         self.setup_bindings()
         self.update_format_options()
 
+    def create_widgets(self) -> None:
+        """Build the widgets. Implemented by EnhancedYouTubeDownloaderUI."""
+        raise NotImplementedError
+
     def setup_styles(self) -> None:
         """Initialize custom widget styles."""
         self.style = ttk.Style()
@@ -45,100 +51,6 @@ class YouTubeDownloaderUI:
         self.style.configure('red.TButton', foreground='red')
         self.style.configure('green.TButton', foreground='green')
         self.style.configure('TCombobox', font=('Arial', 10), padding=5)
-
-    def create_widgets(self) -> None:
-        """Create and arrange all UI components."""
-        # Media Type Selection
-        ttk.Label(self.main_frame, text="Media Type:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.media_type = tk.StringVar(value=self.config_handler('get', 'media_type'))
-        self.type_combobox = ttk.Combobox(
-            self.main_frame,
-            textvariable=self.media_type,
-            values=('Video', 'Audio'),
-            width=10
-        )
-        self.type_combobox.grid(row=0, column=1, pady=5, padx=5, sticky=tk.W)
-
-        # URL Input (single-line by default)
-        ttk.Label(self.main_frame, text="YouTube URL(s):").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.url_entry = ttk.Entry(self.main_frame, width=50)
-        self.url_entry.grid(row=1, column=1, columnspan=2, pady=5, padx=5, sticky=tk.W)
-        self.add_queue_btn = ttk.Button(
-            self.main_frame,
-            text="Add URLs",
-            command=self.process_url_input,
-            width=12
-        )
-        self.add_queue_btn.grid(row=1, column=3, pady=5, padx=5)
-
-        # Path Selection
-        ttk.Label(self.main_frame, text="Download Path:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.path_entry = ttk.Entry(self.main_frame, width=40)
-        self.path_entry.insert(0, self.config_handler('get', 'download_path'))
-        self.path_entry.grid(row=2, column=1, pady=5, padx=5, sticky=tk.W)
-        ttk.Button(self.main_frame, text="Browse", command=self.browse_folder).grid(row=2, column=2, pady=5, padx=5)
-
-        # FFmpeg Path
-        ttk.Label(self.main_frame, text="FFmpeg Path:").grid(row=3, column=0, sticky=tk.W, pady=5)
-        self.ffmpeg_entry = ttk.Entry(self.main_frame, width=40)
-        self.ffmpeg_entry.insert(0, self.config_handler('get', 'ffmpeg_path'))
-        self.ffmpeg_entry.grid(row=3, column=1, pady=5, padx=5, sticky=tk.W)
-        ttk.Button(self.main_frame, text="Browse", command=self.browse_ffmpeg).grid(row=3, column=2, pady=5, padx=5)
-
-        # Quality Selection
-        ttk.Label(self.main_frame, text="Quality:").grid(row=4, column=0, sticky=tk.W, pady=5)
-        self.quality_var = tk.StringVar(value=self.get_default_quality())
-        self.quality_combobox = ttk.Combobox(self.main_frame, textvariable=self.quality_var, width=15)
-        self.quality_combobox.grid(row=4, column=1, pady=5, padx=5, sticky=tk.W)
-
-        # Audio Format (visible only for audio)
-        self.audio_format_label = ttk.Label(self.main_frame, text="Audio Format:")
-        self.audio_format_label.grid(row=4, column=2, sticky=tk.W, pady=5)
-        self.audio_format = tk.StringVar(value=self.config_handler('get', 'audio_format'))
-        self.audio_combobox = ttk.Combobox(
-            self.main_frame,
-            textvariable=self.audio_format,
-            values=('mp3', 'aac', 'wav', 'm4a'),
-            width=8
-        )
-        self.audio_combobox.grid(row=4, column=3, pady=5, padx=5, sticky=tk.W)
-
-        # Download Queue (using Listbox)
-        ttk.Label(self.main_frame, text="Download Queue:").grid(row=5, column=0, sticky=tk.W, pady=5)
-        self.queue_listbox = tk.Listbox(self.main_frame, width=70, height=6)
-        self.queue_listbox.grid(row=6, column=0, columnspan=4, pady=5, sticky=tk.W)
-
-        # Queue Controls
-        self.queue_controls = ttk.Frame(self.main_frame)
-        self.queue_controls.grid(row=7, column=0, columnspan=4, pady=5)
-        self.remove_btn = ttk.Button(
-            self.queue_controls,
-            text="Remove Selected",
-            command=self.remove_selected
-        )
-        self.remove_btn.pack(side=tk.LEFT, padx=2)
-        self.clear_btn = ttk.Button(
-            self.queue_controls,
-            text="Clear Queue",
-            command=self.clear_queue
-        )
-        self.clear_btn.pack(side=tk.LEFT, padx=2)
-
-        # Progress and Status
-        self.progress_bar = ttk.Progressbar(self.main_frame, orient=tk.HORIZONTAL, mode='determinate')
-        self.progress_bar.grid(row=8, column=0, columnspan=4, pady=15, sticky=tk.EW)
-        self.status_label = ttk.Label(self.main_frame, text="Ready", foreground="gray")
-        self.status_label.grid(row=9, column=0, columnspan=4, pady=5)
-
-        # Control Buttons
-        self.download_btn = ttk.Button(
-            self.main_frame,
-            text="Start Queue",
-            command=self.toggle_download,
-            style='green.TButton'
-        )
-        self.download_btn.grid(row=10, column=1, pady=15, padx=5)
-        ttk.Button(self.main_frame, text="Exit", command=self.clean_exit, style='red.TButton').grid(row=10, column=2, pady=15, padx=5)
 
     def setup_bindings(self) -> None:
         """Set up event bindings."""
@@ -155,12 +67,12 @@ class YouTubeDownloaderUI:
         """Update quality options based on the selected media type."""
         media_type = self.media_type.get()
         if media_type == 'Video':
-            self.quality_combobox['values'] = ('Best', '1080p', '720p', '480p', '360p')
+            self.quality_combobox['values'] = Config.VIDEO_QUALITIES
             self.quality_var.set(self.get_default_quality())
             self.audio_combobox.grid_remove()
             self.audio_format_label.grid_remove()
         else:
-            self.quality_combobox['values'] = ('128k', '192k', '256k', '320k')
+            self.quality_combobox['values'] = Config.AUDIO_QUALITIES
             self.quality_var.set(self.get_default_quality())
             self.audio_combobox.grid()
             self.audio_format_label.grid()
@@ -202,71 +114,6 @@ class YouTubeDownloaderUI:
                 "Please ensure you have FFmpeg installed correctly."
             )
 
-    def process_url_input(self) -> None:
-        """Process URLs with improved validation and user feedback."""
-        try:
-            urls = [url.strip() for url in self.url_text.get("1.0", tk.END).splitlines() if url.strip()]
-            
-            if not urls:
-                messagebox.showwarning("No URLs", "Please enter at least one URL to download.")
-                return
-            
-            valid_urls = []
-            invalid_urls = []
-            
-            for url in urls:
-                if self.queue_handler('validate_url', url):
-                    valid_urls.append(url)
-                else:
-                    invalid_urls.append(url)
-            
-            # Add valid URLs to queue
-            for url in valid_urls:
-                item = {
-                    'url': url,
-                    'media_type': self.media_type.get(),
-                    'quality': self.quality_var.get(),
-                    'audio_format': self.audio_format.get(),
-                    'path': self.path_entry.get(),
-                    'ffmpeg_path': self.ffmpeg_entry.get()
-                }
-                if self.queue_handler('add', item):
-                    self.queue_tree.insert('', tk.END, values=(url, self.media_type.get(), "Queued"))
-            
-            # Clear the text input if any URLs were valid
-            if valid_urls:
-                self.url_text.delete("1.0", tk.END)
-                self.status_label.config(
-                    text=f"Added {len(valid_urls)} URL(s) to queue", 
-                    foreground="green"
-                )
-            
-            # Show warning for invalid URLs
-            if invalid_urls:
-                invalid_list = "\n".join(invalid_urls)
-                messagebox.showwarning(
-                    "Invalid URLs",
-                    f"The following URLs are invalid:\n\n{invalid_list}\n\n"
-                    "Please ensure you're using valid YouTube URLs."
-                )
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"An error occurred: {str(e)}")
-            LOGGER.exception("Error processing URL input")
-
-    def remove_selected(self) -> None:
-        """Remove the selected URL from the queue."""
-        selection = self.queue_listbox.curselection()
-        if selection:
-            index = selection[0]
-            self.queue_listbox.delete(index)
-            self.queue_handler('remove', index)
-
-    def clear_queue(self) -> None:
-        """Clear the entire download queue."""
-        self.queue_listbox.delete(0, tk.END)
-        self.queue_handler('clear', None)
-
     def toggle_download(self) -> None:
         """Toggle between starting and cancelling downloads."""
         if self.downloading:
@@ -276,44 +123,6 @@ class YouTubeDownloaderUI:
         else:
             if self.path_validator(self.path_entry.get(), self.ffmpeg_entry.get()):
                 self.start_download()
-
-    def start_download(self) -> None:
-        """Begin the download process."""
-        self.downloading = True
-        self.cancel_requested = False
-        self.download_btn.config(text="Cancel Queue", style='red.TButton')
-        self.status_label.config(text="Starting queue...", foreground="black")
-        self.progress_bar['value'] = 0
-        
-        # Update status of first item
-        first_item = self.queue_tree.get_children()[0]
-        if first_item:
-            self.current_item = {
-                'url': self.queue_tree.item(first_item)['values'][0]
-            }
-            self.update_queue_item_status(self.current_item['url'], "Downloading")
-        
-        self.download_handler('start')
-
-    def update_progress(self, percent: float, speed: str, eta: str) -> None:
-        """Update progress bar and status label."""
-        self.progress_bar['value'] = percent
-        status_text = f"{percent:.1f}% | Speed: {speed} | ETA: {eta}"
-        self.status_label.config(text=status_text, foreground="black")
-
-    def download_complete(self, success: bool) -> None:
-        """Handle completion of download."""
-        if success:
-            self.status_label.config(text="Download complete!", foreground="green")
-            # Update the status of the current item
-            if self.current_item:
-                self.update_queue_item_status(self.current_item['url'], "Complete")
-        else:
-            self.status_label.config(text="Download failed!", foreground="red")
-            if self.current_item:
-                self.update_queue_item_status(self.current_item['url'], "Failed")
-        
-        self.reset_ui()
 
     def reset_ui(self) -> None:
         """Reset UI state after download finishes."""
@@ -437,7 +246,7 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
             if not hasattr(self, 'media_type'):
                 self.media_type = tk.StringVar(value=self.config_handler('get', 'media_type'))
             ttk.Label(parent, text="Media Type:", style='Header.TLabel').grid(row=0, column=0)
-            self.type_combobox = ttk.Combobox(parent, textvariable=self.media_type, values=('Video', 'Audio'), width=10)
+            self.type_combobox = ttk.Combobox(parent, textvariable=self.media_type, values=Config.MEDIA_TYPES, width=10)
             self.type_combobox.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
             
             # Create quality selection controls.
@@ -454,7 +263,7 @@ class EnhancedYouTubeDownloaderUI(YouTubeDownloaderUI):
             self.audio_format_label.grid(row=0, column=4, padx=5, sticky=tk.W)
             if not hasattr(self, 'audio_format'):
                 self.audio_format = tk.StringVar(value=self.config_handler('get', 'audio_format'))
-            self.audio_combobox = ttk.Combobox(parent, textvariable=self.audio_format, values=('mp3', 'aac', 'wav', 'm4a'), width=8)
+            self.audio_combobox = ttk.Combobox(parent, textvariable=self.audio_format, values=Config.AUDIO_FORMATS, width=8)
             self.audio_combobox.grid(row=0, column=5, padx=5, pady=2, sticky=tk.W)
 
 

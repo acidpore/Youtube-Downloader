@@ -6,6 +6,8 @@ import threading
 import time
 import subprocess
 import glob
+import shutil
+import sys
 import uuid
 from collections import deque, OrderedDict
 from typing import Optional, Callable, Any, Dict, List
@@ -21,17 +23,37 @@ LOGGER = logging.getLogger(__name__)
 class DownloadCancelled(Exception):
     """Raised from the progress hook to abort the running yt-dlp download."""
 
+def _app_data_dir() -> str:
+    """Per-user folder for config, queue, history and log files."""
+    if sys.platform == 'win32':
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+        path = os.path.join(base, 'YouTubeDownloader')
+    else:
+        path = os.path.join(os.path.expanduser('~'), '.yt-downloader')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 class Config:
     """Application configuration constants."""
-    DEFAULT_PATHS = {
-        'downloads': os.path.join(os.path.expanduser("~"), "Downloads", "YouTube"),
-        'ffmpeg_windows': 'C:\\ffmpeg\\bin\\ffmpeg.exe',
-        'ffmpeg_linux': '/usr/bin/ffmpeg'
-    }
-    
+    APP_DIR = _app_data_dir()
+    CONFIG_FILE = os.path.join(APP_DIR, 'yt_downloader_config.json')
+    QUEUE_FILE = os.path.join(APP_DIR, 'queue_state.json')
+    HISTORY_FILE = os.path.join(APP_DIR, 'download_history.json')
+    LOG_FILE = os.path.join(APP_DIR, 'yt_downloader.log')
+    DEFAULT_DOWNLOAD_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "YouTube")
+    FFMPEG_CANDIDATES = (
+        '/usr/bin/ffmpeg',
+        '/usr/local/bin/ffmpeg',
+        '/opt/homebrew/bin/ffmpeg',
+        'C:\ffmpeg\bin\ffmpeg.exe',
+    )
+
+    MEDIA_TYPES = ('Video', 'Audio')
     VIDEO_QUALITIES = ('Best', '1080p', '720p', '480p', '360p')
     AUDIO_QUALITIES = ('128k', '192k', '256k', '320k')
     AUDIO_FORMATS = ('mp3', 'aac', 'wav', 'm4a')
+
 
 class DownloadState:
     """Manage download state and transitions."""
@@ -53,47 +75,15 @@ class DownloadState:
         for observer in self.observers:
             observer(self.downloading, self.cancelled)
 
-class DownloadStats:
-    """Track download statistics."""
-    def __init__(self):
-        self.total_downloads = 0
-        self.successful_downloads = 0
-        self.failed_downloads = 0
-        self.total_bytes_downloaded = 0
-        self.start_time = None
-
-    def start_session(self):
-        self.start_time = time.time()
-
-    def update(self, success: bool, bytes_downloaded: int):
-        self.total_downloads += 1
-        self.total_bytes_downloaded += bytes_downloaded
-        if success:
-            self.successful_downloads += 1
-        else:
-            self.failed_downloads += 1
-
-    def get_session_stats(self) -> Dict[str, Any]:
-        if not self.start_time:
-            return {}
-        
-        duration = time.time() - self.start_time
-        return {
-            'duration': duration,
-            'total_downloads': self.total_downloads,
-            'successful': self.successful_downloads,
-            'failed': self.failed_downloads,
-            'total_bytes': self.total_bytes_downloaded,
-            'average_speed': self.total_bytes_downloaded / duration if duration > 0 else 0
-        }
-
 class DownloadHistory:
-    def __init__(self, max_entries=100):
-        self.history_file = 'download_history.json'
+    """Persists a bounded list of finished downloads."""
+    def __init__(self, history_file: str = Config.HISTORY_FILE, max_entries: int = 100):
+        self.history_file = history_file
         self.max_entries = max_entries
-        self.history = self.load_history()
+        self.lock = threading.Lock()
+        self.history: List[Dict[str, Any]] = self.load_history()
 
-    def add_entry(self, url, title, format, status):
+    def add_entry(self, url: str, title: str, format: str, status: str) -> None:
         entry = {
             'url': url,
             'title': title,
@@ -101,41 +91,52 @@ class DownloadHistory:
             'status': status,
             'timestamp': datetime.now().isoformat()
         }
-        self.history.insert(0, entry)
-        self.history = self.history[:self.max_entries]
-        self.save_history()
+        with self.lock:
+            self.history.insert(0, entry)
+            self.history = self.history[:self.max_entries]
+            self.save_history()
 
-    def load_history(self):
+    def load_history(self) -> List[Dict[str, Any]]:
         try:
-            with open(self.history_file, 'r') as f:
-                return json.load(f)
-        except:
+            with open(self.history_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as e:
+            LOGGER.error(f"Error loading download history: {e}")
             return []
 
-    def save_history(self):
-        with open(self.history_file, 'w') as f:
-            json.dump(self.history, f)
+    def save_history(self) -> None:
+        try:
+            with open(self.history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.history, f, indent=2)
+        except OSError as e:
+            LOGGER.error(f"Error saving download history: {e}")
+
 
 class DownloadManager:
     """
     Manages the download queue and performs YouTube downloads using yt-dlp.
     """
-    CONFIG_FILE: str = 'yt_downloader_config.json'
+    CONFIG_FILE: str = Config.CONFIG_FILE
+    QUEUE_FILE: str = Config.QUEUE_FILE
     MAX_RETRIES: int = 3
     RETRY_DELAY: int = 5
-    MEDIA_TYPES = ('Video', 'Audio')
-    VIDEO_QUALITIES = ('Best', '1080p', '720p', '480p', '360p')
-    AUDIO_QUALITIES = ('128k', '192k', '256k', '320k')
-    AUDIO_FORMATS = ('mp3', 'aac', 'wav', 'm4a')
+    MEDIA_TYPES = Config.MEDIA_TYPES
+    VIDEO_QUALITIES = Config.VIDEO_QUALITIES
+    AUDIO_QUALITIES = Config.AUDIO_QUALITIES
+    AUDIO_FORMATS = Config.AUDIO_FORMATS
 
     def __init__(self) -> None:
         """
         Initializes the download manager, including configuration, queue, and logging.
         """
+        self._migrate_legacy_files()
         self.config: OrderedDict = self.load_config()
         self.download_queue: deque[Dict[str, Any]] = deque()
         self.state = DownloadState()
-        self.stats = DownloadStats()
+        self.history = DownloadHistory()
         self.queue_lock = threading.Lock()
         self.current_download: Optional[YoutubeDL] = None
 
@@ -148,12 +149,23 @@ class DownloadManager:
         self.setup_logging()
         self._load_queue_state()
 
+    @staticmethod
+    def _migrate_legacy_files() -> None:
+        """Move data files that older versions wrote to the working directory."""
+        for target in (Config.CONFIG_FILE, Config.QUEUE_FILE, Config.HISTORY_FILE):
+            legacy = os.path.abspath(os.path.basename(target))
+            if legacy != target and os.path.isfile(legacy) and not os.path.exists(target):
+                try:
+                    shutil.move(legacy, target)
+                except OSError as e:
+                    LOGGER.error(f"Could not migrate {legacy}: {e}")
+
     def setup_logging(self) -> None:
         """
         Sets up logging to a file with INFO level.
         """
         root_logger = logging.getLogger()
-        log_path = os.path.abspath('yt_downloader.log')
+        log_path = os.path.abspath(Config.LOG_FILE)
         already_attached = any(
             isinstance(h, logging.FileHandler) and h.baseFilename == log_path
             for h in root_logger.handlers
@@ -193,8 +205,7 @@ class DownloadManager:
         """
         validated = OrderedDict()
         
-        # Get user's home directory for default paths
-        default_download_path = os.path.join(os.path.expanduser("~"), "Downloads", "YouTube")
+        default_download_path = Config.DEFAULT_DOWNLOAD_PATH
         
         # Validate and create download path if it doesn't exist
         download_path = config.get('download_path', default_download_path)
@@ -208,16 +219,7 @@ class DownloadManager:
         # Try to find FFmpeg in common locations
         ffmpeg_path = config.get('ffmpeg_path', '')
         if not self.validate_ffmpeg(ffmpeg_path):
-            common_locations = [
-                'ffmpeg',  # System PATH
-                '/usr/bin/ffmpeg',
-                '/usr/local/bin/ffmpeg',
-                'C:\\ffmpeg\\bin\\ffmpeg.exe'
-            ]
-            for location in common_locations:
-                if self.validate_ffmpeg(location):
-                    ffmpeg_path = location
-                    break
+            ffmpeg_path = self.find_ffmpeg() or ffmpeg_path
                 
         validated['ffmpeg_path'] = ffmpeg_path
         
@@ -258,8 +260,8 @@ class DownloadManager:
     def _load_queue_state(self) -> None:
         """Load saved queue state from file."""
         try:
-            if os.path.exists('queue_state.json'):
-                with open('queue_state.json', 'r') as f:
+            if os.path.exists(self.QUEUE_FILE):
+                with open(self.QUEUE_FILE, 'r') as f:
                     queue_items = json.load(f)
                 for item in queue_items:
                     if item.get('status') != 'Complete':
@@ -272,7 +274,7 @@ class DownloadManager:
         """Save current queue state to file."""
         try:
             queue_items = list(self.download_queue)
-            with open('queue_state.json', 'w') as f:
+            with open(self.QUEUE_FILE, 'w') as f:
                 json.dump(queue_items, f)
         except Exception as e:
             LOGGER.error(f"Error saving queue state: {e}")
@@ -369,6 +371,10 @@ class DownloadManager:
                     self.on_status(f"Download failed: {self.parse_error(e)}", "red")
                 ok = False
 
+            status = {None: 'Cancelled', True: 'Complete', False: 'Failed'}[ok]
+            fmt = item.get('quality', '') if item.get('media_type') == 'Video' else item.get('audio_format', '')
+            self.history.add_entry(item.get('url'), item.get('title', item.get('url')), fmt, status)
+
             if ok is None:
                 self._remove_partial_files(item)
                 self._set_item_status(item, "Cancelled")
@@ -417,8 +423,9 @@ class DownloadManager:
                             return False
                         raise
 
+                    item['title'] = info.get('title', item['url'])
                     if self.on_status:
-                        self.on_status(f"Downloading: {info.get('title', item['url'])}", "black")
+                        self.on_status(f"Downloading: {item['title']}", "black")
 
                     # Perform the actual download
                     ydl.download([item['url']])
@@ -575,6 +582,15 @@ class DownloadManager:
         valid_ffmpeg: bool = self.validate_ffmpeg(ffmpeg_path)
         return valid_dl and valid_ffmpeg
 
+    def find_ffmpeg(self) -> str:
+        """Return the first working FFmpeg found on PATH or in common folders."""
+        candidates = [shutil.which('ffmpeg')]
+        candidates += [p for p in Config.FFMPEG_CANDIDATES if os.path.isfile(p)]
+        for candidate in candidates:
+            if candidate and self.validate_ffmpeg(candidate):
+                return candidate
+        return ''
+
     def validate_ffmpeg(self, path: str) -> bool:
         """
         Validates that FFmpeg is accessible and working.
@@ -582,13 +598,16 @@ class DownloadManager:
         :param path: The path to the FFmpeg executable.
         :return: True if FFmpeg returns its version info, False otherwise.
         """
+        if not path:
+            return False
         try:
             result = subprocess.run([path, '-version'],
                                     capture_output=True,
                                     text=True,
-                                    check=True)
+                                    check=True,
+                                    timeout=10)
             return 'ffmpeg version' in result.stdout.lower()
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        except (subprocess.SubprocessError, OSError) as e:
             logging.error(f"FFmpeg validation error: {str(e)}")
             return False
 
