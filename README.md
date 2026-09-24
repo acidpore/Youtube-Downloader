@@ -41,3 +41,11 @@ Config, antrean, riwayat, dan log disimpan di:
 
 - Windows: `%APPDATA%\YouTubeDownloader\`
 - macOS/Linux: `~/.yt-downloader/`
+
+## Testing
+
+Unit test untuk logika inti (tanpa jaringan, yt-dlp disimulasikan):
+
+```bash
+python -m unittest discover -s tests
+```
